@@ -9,6 +9,9 @@ const DEFAULT_AI_SOURCE_LANG = "english";
 const DEFAULT_AI_TARGET_LANG = "romanian";
 const DEFAULT_AI_MAX_INPUT_LENGTH = 3500;
 const DEFAULT_INSTATUS_RETRY_AFTER_SECONDS = 300;
+const DEFAULT_HIDE_SOURCE_LINKS = true;
+const FEED_CURSOR_KEY = "feed_cursor";
+const INCIDENT_STATE_PREFIX = "incident_state:";
 
 const STATUS_RULES = [
   {
@@ -203,38 +206,22 @@ async function processLatestIncident(env, context = {}) {
     }
 
     const latestIncident = incidents[0];
-    const incidentStatus = mapStatus(latestIncident.title, latestIncident.description);
-    const translatedIncident = {
-      title: await translateTitleToRomanian(latestIncident.title, env, incidentStatus, {
-        maxLength: 250,
-        fallback: "Incident fara titlu",
-      }),
-      description: await translateToRomanian(latestIncident.description, env, {
-        stripHtml: true,
-        maxLength: getMaxDescriptionLength(env),
-        fallback: "Nu exista descriere disponibila.",
-        statusHint: incidentStatus,
-      }),
-      date: formatDateToRomanian(latestIncident.pubDate, env.TIME_ZONE || DEFAULT_TIME_ZONE),
-      link: latestIncident.link || "",
-    };
+    const translatedIncident = await buildPublicIncident(latestIncident, env);
+    const cursor = await readFeedCursor(env);
+    const pendingEntries = getPendingFeedEntries(incidents, cursor);
 
-    const lastIncidentTitle = await env.STATUS_KV.get("last_incident");
-    if (lastIncidentTitle && lastIncidentTitle === latestIncident.title) {
-      return buildResult("Nu exista incident nou.", translatedIncident, 200);
+    if (!pendingEntries.length) {
+      return buildResult("Nu exista actualizari noi in feed.", translatedIncident, 200);
     }
 
     if (!context.allowPublish) {
       return buildResult(
-        "Incident nou detectat. Publicarea in Instatus ruleaza doar prin cron sau printr-un trigger manual autorizat.",
+        pendingEntries.length === 1
+          ? "Exista o actualizare noua in feed. Publicarea in Instatus ruleaza doar prin cron sau printr-un trigger manual autorizat."
+          : `Exista ${pendingEntries.length} actualizari noi in feed. Publicarea in Instatus ruleaza doar prin cron sau printr-un trigger manual autorizat.`,
         translatedIncident,
         200,
       );
-    }
-
-    if (!incidentStatus.instatus) {
-      await env.STATUS_KV.put("last_incident", latestIncident.title);
-      return buildResult("Incident nou detectat, dar starea nu a putut fi mapata pentru Instatus.", translatedIncident, 200);
     }
 
     if (!env.INSTATUS_API_KEY || !env.INSTATUS_PAGE_ID) {
@@ -250,38 +237,326 @@ async function processLatestIncident(env, context = {}) {
       );
     }
 
-    const sendResult = await sendToInstatus(
-      env,
-      {
-        title: translatedIncident.title,
-        description: translatedIncident.description,
-        rawPubDate: latestIncident.pubDate,
-      },
-      incidentStatus,
-    );
-
-    if (!sendResult.ok) {
-      if (sendResult.statusCode === 429) {
-        const retryAfterSeconds = sendResult.retryAfterSeconds || DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+    const syncResult = await syncPendingFeedEntries(env, pendingEntries);
+    if (!syncResult.ok) {
+      if (syncResult.statusCode === 429) {
+        const retryAfterSeconds = syncResult.retryAfterSeconds || DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
         await writeInstatusBackoff(env, retryAfterSeconds);
       }
 
       return buildResult(
-        sendResult.message ?? "Trimiterea catre Instatus a esuat.",
-        translatedIncident,
-        sendResult.statusCode === 429 ? 429 : 502,
+        syncResult.message ?? "Sincronizarea catre Instatus a esuat.",
+        syncResult.incident || translatedIncident,
+        syncResult.statusCode === 429 ? 429 : 502,
       );
     }
 
     await clearInstatusBackoff(env);
-    await env.STATUS_KV.put("last_incident", latestIncident.title);
 
-    const statusMessage = context.source === "cron" ? "Incident procesat prin cron." : "Incident procesat.";
-    return buildResult(statusMessage, translatedIncident, 200);
+    return buildResult(syncResult.message, syncResult.incident || translatedIncident, 200);
   } catch (error) {
     console.error("Eroare procesare:", sanitizeError(error));
     return buildResult("A aparut o eroare la procesarea incidentului.", null, 500);
   }
+}
+
+async function syncPendingFeedEntries(env, entries) {
+  let latestPublicIncident = null;
+  let createdCount = 0;
+  let updatedCount = 0;
+  let resolvedCount = 0;
+  let skippedCount = 0;
+
+  for (const entry of entries) {
+    const sourceIncident = await buildSourceIncident(entry, env);
+    latestPublicIncident = sourceIncident.publicIncident;
+
+    if (!sourceIncident.status.instatus) {
+      await writeFeedCursor(env, sourceIncident);
+      skippedCount += 1;
+      continue;
+    }
+
+    const existingState = await readIncidentState(env, sourceIncident.sourceKey);
+    const action = determineInstatusAction(existingState, sourceIncident);
+
+    if (action === "skip") {
+      await writeFeedCursor(env, sourceIncident);
+      skippedCount += 1;
+      continue;
+    }
+
+    let syncResult;
+    if (action === "create") {
+      syncResult = await createInstatusIncident(env, sourceIncident);
+    } else {
+      syncResult = await updateExistingInstatusIncident(env, existingState, sourceIncident);
+    }
+
+    if (!syncResult.ok) {
+      return {
+        ...syncResult,
+        incident: latestPublicIncident,
+      };
+    }
+
+    await writeIncidentState(env, sourceIncident, syncResult.incidentId);
+    await writeFeedCursor(env, sourceIncident);
+    await env.STATUS_KV.put("last_incident", sourceIncident.rawTitle);
+
+    if (action === "create") {
+      createdCount += 1;
+    } else if (sourceIncident.status.instatus === "RESOLVED") {
+      resolvedCount += 1;
+    } else {
+      updatedCount += 1;
+    }
+  }
+
+  return {
+    ok: true,
+    incident: latestPublicIncident,
+    message: buildSyncSummaryMessage(createdCount, updatedCount, resolvedCount, skippedCount),
+  };
+}
+
+async function buildSourceIncident(entry, env) {
+  const status = mapStatus(entry.title, entry.description);
+  const publicIncident = await buildPublicIncident(entry, env, status);
+
+  return {
+    entryId: entry.entryId || buildSyntheticEntryId(entry),
+    rawTitle: entry.title || "",
+    rawDescription: entry.description || "",
+    rawPubDate: entry.pubDate || "",
+    rawLink: entry.link || "",
+    status,
+    sourceKey: buildSourceIncidentKey(entry.title, status),
+    publicIncident,
+  };
+}
+
+async function buildPublicIncident(entry, env, statusHint = null) {
+  const status = statusHint || mapStatus(entry.title, entry.description);
+  const title = await translateTitleToRomanian(entry.title, env, status, {
+    maxLength: 250,
+    fallback: "Incident fara titlu",
+  });
+  const description = await translateToRomanian(entry.description, env, {
+    stripHtml: true,
+    maxLength: getMaxDescriptionLength(env),
+    fallback: "Nu exista descriere disponibila.",
+    statusHint: status,
+  });
+  const publicLink = buildPublicIncidentLink(entry, env);
+
+  const incident = {
+    title,
+    description: sanitizePublicDescription(description, env),
+    date: formatDateToRomanian(entry.pubDate, env.TIME_ZONE || DEFAULT_TIME_ZONE),
+  };
+
+  if (publicLink) {
+    incident.link = publicLink;
+  }
+
+  return incident;
+}
+
+function determineInstatusAction(existingState, sourceIncident) {
+  if (!existingState?.instatusIncidentId) {
+    return "create";
+  }
+
+  if (existingState.lastFeedEntryId && existingState.lastFeedEntryId === sourceIncident.entryId) {
+    return "skip";
+  }
+
+  if (existingState.currentStatus === "RESOLVED") {
+    return "create";
+  }
+
+  return "update";
+}
+
+function buildSyncSummaryMessage(createdCount, updatedCount, resolvedCount, skippedCount) {
+  const parts = [];
+
+  if (createdCount > 0) {
+    parts.push(`${createdCount} incident nou creat`);
+  }
+
+  if (updatedCount > 0) {
+    parts.push(`${updatedCount} actualizare trimisa`);
+  }
+
+  if (resolvedCount > 0) {
+    parts.push(`${resolvedCount} incident marcat ca rezolvat`);
+  }
+
+  if (skippedCount > 0) {
+    parts.push(`${skippedCount} intrare omisa`);
+  }
+
+  if (!parts.length) {
+    return "Nu a fost necesara nicio modificare in Instatus.";
+  }
+
+  return `${parts.join(", ")}.`;
+}
+
+async function readFeedCursor(env) {
+  try {
+    const raw = await env.STATUS_KV.get(FEED_CURSOR_KEY, "json");
+    if (!raw || typeof raw !== "object") {
+      return null;
+    }
+
+    return {
+      entryId: raw.entryId || "",
+      pubDate: raw.pubDate || "",
+    };
+  } catch (error) {
+    console.error("Eroare cursor feed:", sanitizeError(error));
+    return null;
+  }
+}
+
+async function writeFeedCursor(env, sourceIncident) {
+  try {
+    await env.STATUS_KV.put(
+      FEED_CURSOR_KEY,
+      JSON.stringify({
+        entryId: sourceIncident.entryId,
+        pubDate: sourceIncident.rawPubDate || "",
+      }),
+    );
+  } catch (error) {
+    console.error("Eroare salvare cursor feed:", sanitizeError(error));
+  }
+}
+
+function getPendingFeedEntries(incidents, cursor) {
+  const newestFirst = incidents.filter((entry) => entry.entryId || entry.title);
+  if (!newestFirst.length) {
+    return [];
+  }
+
+  const oldestFirst = [...newestFirst].reverse();
+
+  if (!cursor?.entryId) {
+    return [oldestFirst[oldestFirst.length - 1]];
+  }
+
+  const cursorIndex = oldestFirst.findIndex((entry) => entry.entryId === cursor.entryId);
+  if (cursorIndex >= 0) {
+    return oldestFirst.slice(cursorIndex + 1);
+  }
+
+  const cursorTimestamp = Date.parse(cursor.pubDate || "");
+  if (Number.isFinite(cursorTimestamp)) {
+    const newerByTime = oldestFirst.filter((entry) => {
+      const entryTimestamp = Date.parse(entry.pubDate || "");
+      return Number.isFinite(entryTimestamp) && entryTimestamp > cursorTimestamp;
+    });
+
+    return newerByTime.length ? newerByTime : [oldestFirst[oldestFirst.length - 1]];
+  }
+
+  return [oldestFirst[oldestFirst.length - 1]];
+}
+
+async function readIncidentState(env, sourceKey) {
+  if (!sourceKey) {
+    return null;
+  }
+
+  try {
+    return await env.STATUS_KV.get(getIncidentStateKey(sourceKey), "json");
+  } catch (error) {
+    console.error("Eroare citire stare incident:", sanitizeError(error));
+    return null;
+  }
+}
+
+async function writeIncidentState(env, sourceIncident, instatusIncidentId) {
+  if (!sourceIncident?.sourceKey || !instatusIncidentId) {
+    return;
+  }
+
+  const payload = {
+    sourceKey: sourceIncident.sourceKey,
+    instatusIncidentId,
+    currentStatus: sourceIncident.status.instatus,
+    lastFeedEntryId: sourceIncident.entryId,
+    lastFeedEntryDate: sourceIncident.rawPubDate || "",
+    lastTitle: sourceIncident.rawTitle || "",
+    updatedAt: new Date().toISOString(),
+  };
+
+  try {
+    await env.STATUS_KV.put(getIncidentStateKey(sourceIncident.sourceKey), JSON.stringify(payload));
+  } catch (error) {
+    console.error("Eroare salvare stare incident:", sanitizeError(error));
+  }
+}
+
+function getIncidentStateKey(sourceKey) {
+  return `${INCIDENT_STATE_PREFIX}${sourceKey}`;
+}
+
+function buildSourceIncidentKey(title, statusHint) {
+  const original = normalizeWhitespace(title || "");
+  if (!original) {
+    return "incident-necunoscut";
+  }
+
+  const keywords = statusHint?.keywords || getStatusKeywords(statusHint);
+  const alternation = keywords.length ? keywords.map(escapeRegExp).join("|") : "investigating|identified|monitoring|resolved";
+  const normalized = original
+    .replace(new RegExp(`^\\s*(?:${alternation})\\s*[-:|]\\s*`, "i"), "")
+    .replace(new RegExp(`\\s*[-:|]\\s*(?:${alternation})\\s*$`, "i"), "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  return normalized || original.toLowerCase();
+}
+
+function buildSyntheticEntryId(entry) {
+  return [
+    normalizeWhitespace(entry?.title || ""),
+    normalizeWhitespace(entry?.pubDate || ""),
+    normalizeWhitespace(entry?.link || ""),
+  ].join("|");
+}
+
+function buildPublicIncidentLink(entry, env) {
+  const publicStatusUrl = normalizeWhitespace(env?.PUBLIC_STATUS_URL || "");
+  if (publicStatusUrl) {
+    return publicStatusUrl;
+  }
+
+  if (readBoolean(env?.HIDE_SOURCE_LINKS, DEFAULT_HIDE_SOURCE_LINKS)) {
+    return "";
+  }
+
+  return normalizeWhitespace(entry?.link || "");
+}
+
+function sanitizePublicDescription(description, env) {
+  const normalized = normalizeWhitespace(description || "");
+  if (!normalized) {
+    return "";
+  }
+
+  if (!readBoolean(env?.HIDE_SOURCE_LINKS, DEFAULT_HIDE_SOURCE_LINKS)) {
+    return normalized;
+  }
+
+  return normalizeWhitespace(
+    normalized.replace(/https?:\/\/[^\s)]+/gi, "").replace(/\(\s*\)/g, "").replace(/\[\s*\]/g, ""),
+  );
 }
 
 async function fetchRSS(env) {
@@ -361,6 +636,10 @@ function parseRSS(xml) {
 
 function buildIncidentFromRssBlock(block) {
   return {
+    entryId:
+      extractTagValue(block, "guid") ||
+      extractTagValue(block, "id") ||
+      extractTagValue(block, "link"),
     title: extractTagValue(block, "title"),
     description: extractTagValue(block, "description"),
     pubDate: extractTagValue(block, "pubDate"),
@@ -370,6 +649,10 @@ function buildIncidentFromRssBlock(block) {
 
 function buildIncidentFromAtomBlock(block) {
   return {
+    entryId:
+      extractTagValue(block, "id") ||
+      extractAtomLink(block) ||
+      extractTagValue(block, "link"),
     title: extractTagValue(block, "title"),
     description:
       extractTagValue(block, "summary") ||
@@ -729,27 +1012,91 @@ function normalizeTranslatedStatusPhrases(text, statusHint) {
   return normalized;
 }
 
-async function sendToInstatus(env, incident, mappedStatus) {
+async function createInstatusIncident(env, sourceIncident) {
   const apiBase = (env.INSTATUS_API_BASE_URL || "https://api.instatus.com").replace(/\/+$/, "");
   const pageId = String(env.INSTATUS_PAGE_ID || "").trim();
   const url = `${apiBase}/v1/${encodeURIComponent(pageId)}/incidents`;
 
   const payload = {
-    name: incident.title,
-    message: incident.description,
-    status: mappedStatus.instatus,
+    name: sourceIncident.publicIncident.title,
+    message: sourceIncident.publicIncident.description,
+    status: sourceIncident.status.instatus,
     notify: readBoolean(env.INSTATUS_NOTIFY, false),
     shouldPublish: readBoolean(env.INSTATUS_SHOULD_PUBLISH, true),
   };
 
-  const startedAt = parseDateToIso(incident.rawPubDate);
+  const startedAt = parseDateToIso(sourceIncident.rawPubDate);
   if (startedAt) {
     payload.started = startedAt;
   }
 
+  const response = await performInstatusRequest(env, url, "POST", payload);
+  if (!response.ok) {
+    return response;
+  }
+
+  const incidentId = extractInstatusIncidentId(response.body);
+  if (!incidentId) {
+    return {
+      ok: false,
+      message: "Instatus a raspuns fara ID de incident.",
+    };
+  }
+
+  return {
+    ok: true,
+    incidentId,
+  };
+}
+
+async function updateExistingInstatusIncident(env, existingState, sourceIncident) {
+  const apiBase = (env.INSTATUS_API_BASE_URL || "https://api.instatus.com").replace(/\/+$/, "");
+  const pageId = String(env.INSTATUS_PAGE_ID || "").trim();
+  const incidentId = existingState.instatusIncidentId;
+  const incidentUrl = `${apiBase}/v1/${encodeURIComponent(pageId)}/incidents/${encodeURIComponent(incidentId)}`;
+  const updateUrl = `${incidentUrl}/incident-updates`;
+
+  const startedAt = parseDateToIso(sourceIncident.rawPubDate);
+  const updateIncidentPayload = {
+    name: sourceIncident.publicIncident.title,
+    status: sourceIncident.status.instatus,
+    notify: readBoolean(env.INSTATUS_NOTIFY, false),
+    components: [],
+    statuses: [],
+  };
+
+  if (startedAt) {
+    updateIncidentPayload.started = startedAt;
+  }
+
+  const incidentResponse = await performInstatusRequest(env, incidentUrl, "PUT", updateIncidentPayload);
+  if (!incidentResponse.ok) {
+    return incidentResponse;
+  }
+
+  const incidentUpdatePayload = {
+    message: sourceIncident.publicIncident.description,
+    status: sourceIncident.status.instatus,
+    notify: readBoolean(env.INSTATUS_NOTIFY, false),
+    components: [],
+    statuses: [],
+  };
+
+  const updateResponse = await performInstatusRequest(env, updateUrl, "POST", incidentUpdatePayload);
+  if (!updateResponse.ok) {
+    return updateResponse;
+  }
+
+  return {
+    ok: true,
+    incidentId,
+  };
+}
+
+async function performInstatusRequest(env, url, method, payload) {
   try {
     const response = await fetch(url, {
-      method: "POST",
+      method,
       headers: {
         Authorization: `Bearer ${env.INSTATUS_API_KEY}`,
         "Content-Type": "application/json",
@@ -757,6 +1104,7 @@ async function sendToInstatus(env, incident, mappedStatus) {
       body: JSON.stringify(payload),
     });
 
+    const body = await parseResponseBody(response);
     if (!response.ok) {
       return {
         ok: false,
@@ -766,10 +1114,14 @@ async function sendToInstatus(env, incident, mappedStatus) {
           response.status === 429
             ? "Trimiterea catre Instatus a fost limitata temporar cu codul 429."
             : `Trimiterea catre Instatus a esuat cu codul ${response.status}.`,
+        body,
       };
     }
 
-    return { ok: true };
+    return {
+      ok: true,
+      body,
+    };
   } catch (error) {
     console.error("Eroare Instatus:", sanitizeError(error));
     return {
@@ -777,6 +1129,42 @@ async function sendToInstatus(env, incident, mappedStatus) {
       message: "Trimiterea catre Instatus a esuat.",
     };
   }
+}
+
+async function parseResponseBody(response) {
+  try {
+    return await response.json();
+  } catch {
+    try {
+      return await response.text();
+    } catch {
+      return null;
+    }
+  }
+}
+
+function extractInstatusIncidentId(body) {
+  if (!body) {
+    return "";
+  }
+
+  if (typeof body === "string") {
+    return "";
+  }
+
+  if (typeof body.id === "string" && body.id) {
+    return body.id;
+  }
+
+  if (body.incident && typeof body.incident.id === "string" && body.incident.id) {
+    return body.incident.id;
+  }
+
+  if (body.data && typeof body.data.id === "string" && body.data.id) {
+    return body.data.id;
+  }
+
+  return "";
 }
 
 function extractTagValue(block, tagName) {

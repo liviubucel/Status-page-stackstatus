@@ -21,8 +21,8 @@ Worker Cloudflare production-ready care:
 3. Parseaza manual atat RSS clasic (`<item>`), cat si Atom (`<entry>`), pentru campurile `title`, `description`, `pubDate` sau `updated`, `link`.
 4. Curata HTML-ul din descriere si normalizeaza spatiile.
 5. Traduce automat textul in romana prin Workers AI, iar daca binding-ul AI lipseste sau modelul esueaza, foloseste fallback-ul local pe reguli si dictionar.
-6. Ia cel mai nou item si il compara cu `STATUS_KV.get("last_incident")`.
-7. Publica in Instatus doar din cron sau dintr-un trigger manual autorizat, apoi salveaza titlul in KV.
+6. Tine cursor in KV pentru ultimul entry procesat din feed si proceseaza doar entry-urile noi.
+7. Coreleaza update-urile `Investigating / Identified / Monitoring / Resolved` pe acelasi incident Instatus.
 8. Returneaza JSON clar in romana.
 
 ## Deploy si configurare
@@ -135,6 +135,8 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `TIME_ZONE`
 - `MAX_DESCRIPTION_LENGTH`
 - `FETCH_TIMEOUT_MS`
+- `PUBLIC_STATUS_URL`
+- `HIDE_SOURCE_LINKS`
 - `INSTATUS_NOTIFY`
 - `INSTATUS_SHOULD_PUBLISH`
 - `AI_TRANSLATION_ENABLED`
@@ -200,6 +202,8 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 - `TIME_ZONE` - optional
 - `MAX_DESCRIPTION_LENGTH` - optional
 - `FETCH_TIMEOUT_MS` - optional
+- `PUBLIC_STATUS_URL` - optional, URL-ul public ZebraByte afisat in raspuns
+- `HIDE_SOURCE_LINKS` - optional, ascunde linkurile directe catre `stackstatus.com`
 - `INSTATUS_NOTIFY` - optional
 - `INSTATUS_SHOULD_PUBLISH` - optional
 - `AI` - binding Workers AI recomandat pentru traducere automata
@@ -296,3 +300,5 @@ Intern, maparea ramane:
 - Daca Workers AI nu este configurat sau esueaza, traducerea cade automat pe fallback-ul local.
 - Cererile HTTP normale nu mai publica in Instatus, ceea ce reduce drastic riscul de `429`.
 - Daca Instatus raspunde cu `429`, Worker-ul respecta un backoff temporar salvat in KV.
+- Worker-ul proceseaza entry-urile noi din feed in ordine si poate face create sau update pe acelasi incident Instatus.
+- Daca `PUBLIC_STATUS_URL` este gol si `HIDE_SOURCE_LINKS=true`, raspunsul public nu mai expune `stackstatus.com`.
