@@ -3,6 +3,11 @@ const DEFAULT_RSS_FALLBACK_URL = "";
 const DEFAULT_FETCH_TIMEOUT_MS = 15000;
 const DEFAULT_MAX_DESCRIPTION_LENGTH = 1800;
 const DEFAULT_TIME_ZONE = "Europe/Bucharest";
+const DEFAULT_AI_TRANSLATION_MODEL = "@cf/meta/m2m100-1.2b";
+const DEFAULT_AI_TRANSLATION_ENABLED = true;
+const DEFAULT_AI_SOURCE_LANG = "english";
+const DEFAULT_AI_TARGET_LANG = "romanian";
+const DEFAULT_AI_MAX_INPUT_LENGTH = 3500;
 
 const STATUS_RULES = [
   {
@@ -185,14 +190,15 @@ async function processLatestIncident(env, context = {}) {
     const latestIncident = incidents[0];
     const incidentStatus = mapStatus(latestIncident.title, latestIncident.description);
     const translatedIncident = {
-      title: translateToRomanian(latestIncident.title, {
+      title: await translateTitleToRomanian(latestIncident.title, env, incidentStatus, {
         maxLength: 250,
         fallback: "Incident fara titlu",
       }),
-      description: translateToRomanian(latestIncident.description, {
+      description: await translateToRomanian(latestIncident.description, env, {
         stripHtml: true,
         maxLength: getMaxDescriptionLength(env),
         fallback: "Nu exista descriere disponibila.",
+        statusHint: incidentStatus,
       }),
       date: formatDateToRomanian(latestIncident.pubDate, env.TIME_ZONE || DEFAULT_TIME_ZONE),
       link: latestIncident.link || "",
@@ -335,15 +341,76 @@ function buildIncidentFromAtomBlock(block) {
   };
 }
 
-function translateToRomanian(input, options = {}) {
+async function translateTitleToRomanian(input, env, statusHint, options = {}) {
+  const fallbackTitle = buildFallbackTranslatedTitle(input, statusHint, options);
+  const titleStructure = extractStatusFromTitle(input, statusHint);
+
+  if (!titleStructure) {
+    return translateToRomanian(input, env, {
+      ...options,
+      statusHint,
+      fallback: fallbackTitle,
+    });
+  }
+
+  const translatedRemainder = await translateToRomanian(titleStructure.remainder, env, {
+    ...options,
+    fallback: titleStructure.remainder
+      ? fallbackTranslateToRomanian(titleStructure.remainder, options)
+      : "",
+  });
+
+  return rebuildTranslatedTitle(titleStructure, translatedRemainder, statusHint, options) || fallbackTitle;
+}
+
+async function translateToRomanian(input, env, options = {}) {
+  const fallback = fallbackTranslateToRomanian(input, options);
+  const prepared = prepareTextForTranslation(input, options);
+
+  if (!prepared) {
+    return fallback;
+  }
+
+  if (!shouldUseAiTranslation(env)) {
+    return fallback;
+  }
+
+  try {
+    const aiResponse = await env.AI.run(getAiTranslationModel(env), {
+      text: limitLength(prepared, getAiMaxInputLength(env)),
+      source_lang: env.AI_SOURCE_LANG || DEFAULT_AI_SOURCE_LANG,
+      target_lang: env.AI_TARGET_LANG || DEFAULT_AI_TARGET_LANG,
+    });
+
+    const translated = extractAiTranslatedText(aiResponse);
+    if (!translated) {
+      return fallback;
+    }
+
+    let normalized = options.stripHtml ? stripHtml(translated) : normalizeWhitespace(translated);
+    normalized = normalizeTranslatedStatusPhrases(normalized, options.statusHint);
+    normalized = normalizeSentenceSpacing(normalized);
+    normalized = capitalizeRomanianText(normalized);
+
+    const maxLength = Number.parseInt(options.maxLength, 10);
+    if (Number.isFinite(maxLength) && maxLength > 0) {
+      normalized = limitLength(normalized, maxLength);
+    }
+
+    return normalized || fallback;
+  } catch (error) {
+    console.error("Eroare traducere AI:", sanitizeError(error));
+    return fallback;
+  }
+}
+
+function fallbackTranslateToRomanian(input, options = {}) {
   const fallback = options.fallback ?? "";
   if (!input || typeof input !== "string") {
     return fallback;
   }
 
-  let text = removeCdata(input);
-  text = decodeXmlEntities(text);
-  text = options.stripHtml ? stripHtml(text) : normalizeWhitespace(text);
+  let text = prepareTextForTranslation(input, options);
   if (!text) {
     return fallback;
   }
@@ -382,6 +449,174 @@ function mapStatus(title, description) {
     translated: "Actualizare incident",
     instatus: null,
   };
+}
+
+function prepareTextForTranslation(input, options = {}) {
+  if (!input || typeof input !== "string") {
+    return options.fallback ?? "";
+  }
+
+  let text = removeCdata(input);
+  text = decodeXmlEntities(text);
+  text = options.stripHtml ? stripHtml(text) : normalizeWhitespace(text);
+  return text;
+}
+
+function shouldUseAiTranslation(env) {
+  return Boolean(env?.AI && typeof env.AI.run === "function" && readBoolean(env.AI_TRANSLATION_ENABLED, DEFAULT_AI_TRANSLATION_ENABLED));
+}
+
+function getAiTranslationModel(env) {
+  return env?.AI_TRANSLATION_MODEL || DEFAULT_AI_TRANSLATION_MODEL;
+}
+
+function getAiMaxInputLength(env) {
+  const parsed = Number.parseInt(env?.AI_MAX_INPUT_LENGTH, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AI_MAX_INPUT_LENGTH;
+}
+
+function extractAiTranslatedText(aiResponse) {
+  if (!aiResponse) {
+    return "";
+  }
+
+  if (typeof aiResponse === "string") {
+    return normalizeWhitespace(aiResponse);
+  }
+
+  if (Array.isArray(aiResponse)) {
+    for (const item of aiResponse) {
+      const extracted = extractAiTranslatedText(item);
+      if (extracted) {
+        return extracted;
+      }
+    }
+  }
+
+  const candidateKeys = [
+    "translated_text",
+    "translation",
+    "text",
+    "output",
+    "response",
+    "result",
+  ];
+
+  for (const key of candidateKeys) {
+    const value = aiResponse[key];
+    if (typeof value === "string" && normalizeWhitespace(value)) {
+      return normalizeWhitespace(value);
+    }
+  }
+
+  if (Array.isArray(aiResponse.translations) && aiResponse.translations.length) {
+    return extractAiTranslatedText(aiResponse.translations[0]);
+  }
+
+  if (Array.isArray(aiResponse.results) && aiResponse.results.length) {
+    return extractAiTranslatedText(aiResponse.results[0]);
+  }
+
+  return "";
+}
+
+function extractStatusFromTitle(title, statusHint) {
+  if (!title || !statusHint?.translated) {
+    return null;
+  }
+
+  const keywords = getStatusKeywords(statusHint);
+  if (!keywords.length) {
+    return null;
+  }
+
+  const alternation = keywords.map(escapeRegExp).join("|");
+  const prefixPattern = new RegExp(`^\\s*(${alternation})\\s*[-:|]\\s*(.+?)\\s*$`, "i");
+  const suffixPattern = new RegExp(`^\\s*(.+?)\\s*[-:|]\\s*(${alternation})\\s*$`, "i");
+  const exactPattern = new RegExp(`^\\s*(${alternation})\\s*$`, "i");
+
+  const prefixMatch = title.match(prefixPattern);
+  if (prefixMatch) {
+    return {
+      position: "prefix",
+      remainder: normalizeWhitespace(prefixMatch[2] || ""),
+    };
+  }
+
+  const suffixMatch = title.match(suffixPattern);
+  if (suffixMatch) {
+    return {
+      position: "suffix",
+      remainder: normalizeWhitespace(suffixMatch[1] || ""),
+    };
+  }
+
+  if (title.match(exactPattern)) {
+    return {
+      position: "exact",
+      remainder: "",
+    };
+  }
+
+  return null;
+}
+
+function getStatusKeywords(statusHint) {
+  if (!statusHint?.key) {
+    return [];
+  }
+
+  const matchingRule = STATUS_RULES.find((rule) => rule.key === statusHint.key);
+  return matchingRule?.keywords || [];
+}
+
+function buildFallbackTranslatedTitle(title, statusHint, options = {}) {
+  const structure = extractStatusFromTitle(title, statusHint);
+  if (!structure) {
+    return fallbackTranslateToRomanian(title, options);
+  }
+
+  return rebuildTranslatedTitle(
+    structure,
+    fallbackTranslateToRomanian(structure.remainder, options),
+    statusHint,
+    options,
+  );
+}
+
+function rebuildTranslatedTitle(structure, translatedRemainder, statusHint, options = {}) {
+  const statusLabel = statusHint?.translated || options.fallback || "Actualizare incident";
+  const cleanRemainder = capitalizeRomanianText(normalizeWhitespace(translatedRemainder));
+
+  if (structure?.position === "prefix") {
+    return cleanRemainder ? `${statusLabel} - ${cleanRemainder}` : statusLabel;
+  }
+
+  if (structure?.position === "suffix") {
+    return cleanRemainder ? `${cleanRemainder} - ${statusLabel}` : statusLabel;
+  }
+
+  if (structure?.position === "exact") {
+    return statusLabel;
+  }
+
+  return cleanRemainder || statusLabel;
+}
+
+function normalizeTranslatedStatusPhrases(text, statusHint) {
+  let normalized = String(text || "");
+
+  normalized = normalized
+    .replace(/\b(?:investigating|investigating issue|under investigation)\b/gi, "Investigam")
+    .replace(/\b(?:identified|issue identified|cause identified)\b/gi, "Identificat")
+    .replace(/\b(?:monitoring|closely monitoring)\b/gi, "Monitorizam")
+    .replace(/\b(?:resolved|issue resolved|incident resolved)\b/gi, "Rezolvat");
+
+  if (statusHint?.translated) {
+    normalized = replaceCaseInsensitive(normalized, statusHint.translated, statusHint.translated);
+  }
+
+  return normalized;
 }
 
 async function sendToInstatus(env, incident, mappedStatus) {

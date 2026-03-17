@@ -11,6 +11,14 @@ FETCH_TIMEOUT_MS = "15000"
 INSTATUS_API_BASE_URL = "https://api.instatus.com"
 INSTATUS_NOTIFY = "false"
 INSTATUS_SHOULD_PUBLISH = "true"
+AI_TRANSLATION_ENABLED = "true"
+AI_TRANSLATION_MODEL = "@cf/meta/m2m100-1.2b"
+AI_SOURCE_LANG = "english"
+AI_TARGET_LANG = "romanian"
+AI_MAX_INPUT_LENGTH = "3500"
+
+[ai]
+binding = "AI"
 
 [triggers]
 crons = ["*/5 * * * *"]

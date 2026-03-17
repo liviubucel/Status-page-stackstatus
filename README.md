@@ -4,7 +4,7 @@ Worker Cloudflare production-ready care:
 
 - preia feed-ul RSS StackStatus
 - parseaza XML fara librarii externe
-- traduce continutul in romana
+- traduce automat continutul in romana cu Workers AI
 - detecteaza ultimul incident nou cu KV
 - trimite incidentul in Instatus
 - returneaza JSON sigur, fara exceptii necapturate
@@ -20,7 +20,7 @@ Worker Cloudflare production-ready care:
 2. Daca ai un endpoint RSS diferit pentru 20i, il poti seta prin `RSS_URL`.
 3. Parseaza manual atat RSS clasic (`<item>`), cat si Atom (`<entry>`), pentru campurile `title`, `description`, `pubDate` sau `updated`, `link`.
 4. Curata HTML-ul din descriere si normalizeaza spatiile.
-5. Traduce textul in romana prin reguli pentru status si fraze uzuale.
+5. Traduce automat textul in romana prin Workers AI, iar daca binding-ul AI lipseste sau modelul esueaza, foloseste fallback-ul local pe reguli si dictionar.
 6. Ia cel mai nou item si il compara cu `STATUS_KV.get("last_incident")`.
 7. Daca este nou, il trimite in Instatus si apoi salveaza titlul in KV.
 8. Returneaza JSON clar in romana.
@@ -95,7 +95,32 @@ npx wrangler secret put INSTATUS_PAGE_ID
 
 Poti lasa `INSTATUS_PAGE_ID` si in `wrangler.toml` ca variabila normala daca preferi, dar pentru un setup curat este mai simplu sa o pastrezi si pe ea ca secret.
 
-### 4. Ajusteaza variabilele optionale
+### 4. Activeaza Workers AI pentru traducere automata
+
+Adauga binding-ul AI in Worker. In acest proiect este deja definit in [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml):
+
+```toml
+[ai]
+binding = "AI"
+```
+
+Pentru Connected Builds sau daca preferi configurarea din dashboard:
+
+1. `Workers & Pages`
+2. Worker-ul tau
+3. `Settings`
+4. `Bindings`
+5. `Add binding`
+6. tip `Workers AI`
+7. Variable name: `AI`
+
+Modelul folosit implicit este:
+
+- `@cf/meta/m2m100-1.2b`
+
+Worker-ul continua sa functioneze si fara binding-ul AI, dar traducerea va cadea pe fallback-ul local, mai limitat.
+
+### 5. Ajusteaza variabilele optionale
 
 In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifica:
 
@@ -106,8 +131,13 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `FETCH_TIMEOUT_MS`
 - `INSTATUS_NOTIFY`
 - `INSTATUS_SHOULD_PUBLISH`
+- `AI_TRANSLATION_ENABLED`
+- `AI_TRANSLATION_MODEL`
+- `AI_SOURCE_LANG`
+- `AI_TARGET_LANG`
+- `AI_MAX_INPUT_LENGTH`
 
-### 5. Adauga cron trigger
+### 6. Adauga cron trigger
 
 Cron-ul este deja definit in [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml):
 
@@ -123,7 +153,7 @@ Daca vrei alt interval:
 - la 1 minut: `* * * * *`
 - la 10 minute: `*/10 * * * *`
 
-### 6. Ruleaza local
+### 7. Ruleaza local
 
 ```powershell
 npx wrangler dev --test-scheduled
@@ -135,7 +165,7 @@ Pentru a testa cron local:
 curl "http://127.0.0.1:8787/cdn-cgi/handler/scheduled?cron=*/5+*+*+*+*"
 ```
 
-### 7. Deploy
+### 8. Deploy
 
 ```powershell
 npx wrangler deploy
@@ -153,6 +183,12 @@ npx wrangler deploy
 - `FETCH_TIMEOUT_MS` - optional
 - `INSTATUS_NOTIFY` - optional
 - `INSTATUS_SHOULD_PUBLISH` - optional
+- `AI` - binding Workers AI recomandat pentru traducere automata
+- `AI_TRANSLATION_ENABLED` - optional
+- `AI_TRANSLATION_MODEL` - optional
+- `AI_SOURCE_LANG` - optional
+- `AI_TARGET_LANG` - optional
+- `AI_MAX_INPUT_LENGTH` - optional
 
 ## Observatie importanta despre Instatus
 
@@ -237,3 +273,4 @@ Intern, maparea ramane:
 - Instatus nu este apelat daca incidentul este duplicat.
 - Titlul este salvat in KV doar dupa un POST Instatus reusit.
 - Descrierea este curatata de HTML si limitata ca lungime.
+- Daca Workers AI nu este configurat sau esueaza, traducerea cade automat pe fallback-ul local.
