@@ -8,6 +8,7 @@ const DEFAULT_AI_TRANSLATION_ENABLED = true;
 const DEFAULT_AI_SOURCE_LANG = "english";
 const DEFAULT_AI_TARGET_LANG = "romanian";
 const DEFAULT_AI_MAX_INPUT_LENGTH = 3500;
+const DEFAULT_INSTATUS_RETRY_AFTER_SECONDS = 300;
 
 const STATUS_RULES = [
   {
@@ -151,6 +152,7 @@ async function runScheduled(env, event) {
   try {
     const result = await processLatestIncident(env, {
       source: "cron",
+      allowPublish: true,
       cron: event?.cron ?? null,
     });
 
@@ -161,7 +163,20 @@ async function runScheduled(env, event) {
 }
 
 async function handleRequest(_request, env) {
-  const result = await processLatestIncident(env, { source: "http" });
+  const requestUrl = new URL(_request.url);
+  const isManualSync = requestUrl.searchParams.get("sync") === "1";
+  const providedToken = requestUrl.searchParams.get("token") || "";
+  const allowManualSync = Boolean(
+    isManualSync &&
+      env.MANUAL_SYNC_TOKEN &&
+      providedToken &&
+      providedToken === env.MANUAL_SYNC_TOKEN,
+  );
+
+  const result = await processLatestIncident(env, {
+    source: "http",
+    allowPublish: allowManualSync,
+  });
   return jsonResponse(
     {
       status: result.status,
@@ -209,6 +224,14 @@ async function processLatestIncident(env, context = {}) {
       return buildResult("Nu exista incident nou.", translatedIncident, 200);
     }
 
+    if (!context.allowPublish) {
+      return buildResult(
+        "Incident nou detectat. Publicarea in Instatus ruleaza doar prin cron sau printr-un trigger manual autorizat.",
+        translatedIncident,
+        200,
+      );
+    }
+
     if (!incidentStatus.instatus) {
       await env.STATUS_KV.put("last_incident", latestIncident.title);
       return buildResult("Incident nou detectat, dar starea nu a putut fi mapata pentru Instatus.", translatedIncident, 200);
@@ -216,6 +239,15 @@ async function processLatestIncident(env, context = {}) {
 
     if (!env.INSTATUS_API_KEY || !env.INSTATUS_PAGE_ID) {
       return buildResult("Configuratia Instatus lipseste. Seteaza INSTATUS_API_KEY si INSTATUS_PAGE_ID.", translatedIncident, 500);
+    }
+
+    const backoffCheck = await readInstatusBackoff(env);
+    if (backoffCheck.active) {
+      return buildResult(
+        `Instatus limiteaza temporar cererile. Urmatoarea incercare dupa ${backoffCheck.untilFormatted}.`,
+        translatedIncident,
+        200,
+      );
     }
 
     const sendResult = await sendToInstatus(
@@ -229,9 +261,19 @@ async function processLatestIncident(env, context = {}) {
     );
 
     if (!sendResult.ok) {
-      return buildResult(sendResult.message ?? "Trimiterea catre Instatus a esuat.", translatedIncident, 502);
+      if (sendResult.statusCode === 429) {
+        const retryAfterSeconds = sendResult.retryAfterSeconds || DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+        await writeInstatusBackoff(env, retryAfterSeconds);
+      }
+
+      return buildResult(
+        sendResult.message ?? "Trimiterea catre Instatus a esuat.",
+        translatedIncident,
+        sendResult.statusCode === 429 ? 429 : 502,
+      );
     }
 
+    await clearInstatusBackoff(env);
     await env.STATUS_KV.put("last_incident", latestIncident.title);
 
     const statusMessage = context.source === "cron" ? "Incident procesat prin cron." : "Incident procesat.";
@@ -462,6 +504,74 @@ function prepareTextForTranslation(input, options = {}) {
   return text;
 }
 
+async function readInstatusBackoff(env) {
+  try {
+    const value = await env.STATUS_KV.get("instatus_rate_limited_until");
+    if (!value) {
+      return { active: false, until: null, untilFormatted: "" };
+    }
+
+    const until = Number.parseInt(value, 10);
+    if (!Number.isFinite(until) || until <= Date.now()) {
+      await env.STATUS_KV.delete("instatus_rate_limited_until");
+      return { active: false, until: null, untilFormatted: "" };
+    }
+
+    return {
+      active: true,
+      until,
+      untilFormatted: formatTimestampToRomanian(until, env.TIME_ZONE || DEFAULT_TIME_ZONE),
+    };
+  } catch (error) {
+    console.error("Eroare backoff Instatus:", sanitizeError(error));
+    return { active: false, until: null, untilFormatted: "" };
+  }
+}
+
+async function writeInstatusBackoff(env, retryAfterSeconds) {
+  const safeSeconds =
+    Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? retryAfterSeconds
+      : DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+  const until = Date.now() + safeSeconds * 1000;
+
+  try {
+    await env.STATUS_KV.put("instatus_rate_limited_until", String(until), {
+      expirationTtl: safeSeconds,
+    });
+  } catch (error) {
+    console.error("Eroare salvare backoff Instatus:", sanitizeError(error));
+  }
+}
+
+async function clearInstatusBackoff(env) {
+  try {
+    await env.STATUS_KV.delete("instatus_rate_limited_until");
+  } catch (error) {
+    console.error("Eroare stergere backoff Instatus:", sanitizeError(error));
+  }
+}
+
+function getRetryAfterSeconds(response) {
+  const header = response.headers.get("Retry-After");
+  if (!header) {
+    return DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+  }
+
+  const seconds = Number.parseInt(header, 10);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return seconds;
+  }
+
+  const dateValue = Date.parse(header);
+  if (Number.isFinite(dateValue)) {
+    const deltaSeconds = Math.ceil((dateValue - Date.now()) / 1000);
+    return deltaSeconds > 0 ? deltaSeconds : DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+  }
+
+  return DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+}
+
 function shouldUseAiTranslation(env) {
   return Boolean(env?.AI && typeof env.AI.run === "function" && readBoolean(env.AI_TRANSLATION_ENABLED, DEFAULT_AI_TRANSLATION_ENABLED));
 }
@@ -650,7 +760,12 @@ async function sendToInstatus(env, incident, mappedStatus) {
     if (!response.ok) {
       return {
         ok: false,
-        message: `Trimiterea catre Instatus a esuat cu codul ${response.status}.`,
+        statusCode: response.status,
+        retryAfterSeconds: getRetryAfterSeconds(response),
+        message:
+          response.status === 429
+            ? "Trimiterea catre Instatus a fost limitata temporar cu codul 429."
+            : `Trimiterea catre Instatus a esuat cu codul ${response.status}.`,
       };
     }
 
@@ -830,6 +945,14 @@ function formatDateToRomanian(pubDate, timeZone) {
   } catch {
     return parsed.toISOString();
   }
+}
+
+function formatTimestampToRomanian(timestamp, timeZone) {
+  if (!timestamp) {
+    return "";
+  }
+
+  return formatDateToRomanian(new Date(timestamp).toISOString(), timeZone);
 }
 
 function parseDateToIso(pubDate) {

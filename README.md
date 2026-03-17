@@ -22,7 +22,7 @@ Worker Cloudflare production-ready care:
 4. Curata HTML-ul din descriere si normalizeaza spatiile.
 5. Traduce automat textul in romana prin Workers AI, iar daca binding-ul AI lipseste sau modelul esueaza, foloseste fallback-ul local pe reguli si dictionar.
 6. Ia cel mai nou item si il compara cu `STATUS_KV.get("last_incident")`.
-7. Daca este nou, il trimite in Instatus si apoi salveaza titlul in KV.
+7. Publica in Instatus doar din cron sau dintr-un trigger manual autorizat, apoi salveaza titlul in KV.
 8. Returneaza JSON clar in romana.
 
 ## Deploy si configurare
@@ -95,6 +95,12 @@ npx wrangler secret put INSTATUS_PAGE_ID
 
 Poti lasa `INSTATUS_PAGE_ID` si in `wrangler.toml` ca variabila normala daca preferi, dar pentru un setup curat este mai simplu sa o pastrezi si pe ea ca secret.
 
+Optional, pentru trigger manual securizat:
+
+```powershell
+npx wrangler secret put MANUAL_SYNC_TOKEN
+```
+
 ### 4. Activeaza Workers AI pentru traducere automata
 
 Adauga binding-ul AI in Worker. In acest proiect este deja definit in [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml):
@@ -136,6 +142,7 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `AI_SOURCE_LANG`
 - `AI_TARGET_LANG`
 - `AI_MAX_INPUT_LENGTH`
+- `MANUAL_SYNC_TOKEN`
 
 ### 6. Adauga cron trigger
 
@@ -171,6 +178,18 @@ curl "http://127.0.0.1:8787/cdn-cgi/handler/scheduled?cron=*/5+*+*+*+*"
 npx wrangler deploy
 ```
 
+### Trigger manual securizat
+
+URL-ul normal al Worker-ului este acum read-only si nu mai trimite incidente in Instatus. Asta evita spam-ul si erorile `429`.
+
+Pentru a forta manual o sincronizare:
+
+```text
+https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU
+```
+
+Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST spre Instatus.
+
 ## Variabile folosite
 
 - `STATUS_KV` - binding KV obligatoriu
@@ -189,6 +208,7 @@ npx wrangler deploy
 - `AI_SOURCE_LANG` - optional
 - `AI_TARGET_LANG` - optional
 - `AI_MAX_INPUT_LENGTH` - optional
+- `MANUAL_SYNC_TOKEN` - optional, recomandat ca secret
 
 ## Observatie importanta despre Instatus
 
@@ -274,3 +294,5 @@ Intern, maparea ramane:
 - Titlul este salvat in KV doar dupa un POST Instatus reusit.
 - Descrierea este curatata de HTML si limitata ca lungime.
 - Daca Workers AI nu este configurat sau esueaza, traducerea cade automat pe fallback-ul local.
+- Cererile HTTP normale nu mai publica in Instatus, ceea ce reduce drastic riscul de `429`.
+- Daca Instatus raspunde cu `429`, Worker-ul respecta un backoff temporar salvat in KV.
