@@ -16,9 +16,9 @@ Worker Cloudflare production-ready care:
 
 ## Ce face Worker-ul
 
-1. Cere RSS-ul de la `https://www.stackstatus.com/history.rss`, adica pagina Stack Status folosita de 20i.
+1. Cere feed-ul public de la `https://www.stackstatus.com/rss`, adica pagina Stack Status folosita de 20i.
 2. Daca ai un endpoint RSS diferit pentru 20i, il poti seta prin `RSS_URL`.
-3. Parseaza manual campurile `title`, `description`, `pubDate`, `link`.
+3. Parseaza manual atat RSS clasic (`<item>`), cat si Atom (`<entry>`), pentru campurile `title`, `description`, `pubDate` sau `updated`, `link`.
 4. Curata HTML-ul din descriere si normalizeaza spatiile.
 5. Traduce textul in romana prin reguli pentru status si fraze uzuale.
 6. Ia cel mai nou item si il compara cu `STATUS_KV.get("last_incident")`.
@@ -156,7 +156,7 @@ npx wrangler deploy
 
 ## Observatie importanta despre Instatus
 
-Sursa monitorizata in acest proiect este Stack Status de la 20i, nu `stackstatus.net` de la Stack Exchange.
+Sursa monitorizata in acest proiect este Stack Status de la 20i, pe `https://www.stackstatus.com/rss`, nu `stackstatus.net` de la Stack Exchange.
 
 Worker-ul foloseste endpoint-ul curent de API:
 

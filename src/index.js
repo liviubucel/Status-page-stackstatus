@@ -1,4 +1,4 @@
-const DEFAULT_RSS_URL = "https://www.stackstatus.com/history.rss";
+const DEFAULT_RSS_URL = "https://www.stackstatus.com/rss";
 const DEFAULT_RSS_FALLBACK_URL = "";
 const DEFAULT_FETCH_TIMEOUT_MS = 15000;
 const DEFAULT_MAX_DESCRIPTION_LENGTH = 1800;
@@ -265,7 +265,7 @@ async function fetchRSS(env) {
       }
 
       const xml = await response.text();
-      if (!xml || !xml.includes("<item")) {
+      if (!xml || (!xml.includes("<item") && !xml.includes("<entry"))) {
         lastMessage = "RSS-ul primit este gol sau invalid.";
         continue;
       }
@@ -289,18 +289,15 @@ function parseRSS(xml) {
   }
 
   try {
-    const itemMatches = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
-    const items = itemMatches
-      .map((match) => {
-        const block = match[1] || "";
-        return {
-          title: extractTagValue(block, "title"),
-          description: extractTagValue(block, "description"),
-          pubDate: extractTagValue(block, "pubDate"),
-          link: extractTagValue(block, "link"),
-        };
-      })
-      .filter((item) => item.title || item.description || item.link);
+    const rssItems = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)].map((match) =>
+      buildIncidentFromRssBlock(match[1] || ""),
+    );
+
+    const atomItems = [...xml.matchAll(/<entry\b[^>]*>([\s\S]*?)<\/entry>/gi)].map((match) =>
+      buildIncidentFromAtomBlock(match[1] || ""),
+    );
+
+    const items = [...rssItems, ...atomItems].filter((item) => item.title || item.description || item.link);
 
     items.sort((left, right) => {
       const leftTime = Date.parse(left.pubDate || "") || 0;
@@ -312,6 +309,30 @@ function parseRSS(xml) {
   } catch {
     return [];
   }
+}
+
+function buildIncidentFromRssBlock(block) {
+  return {
+    title: extractTagValue(block, "title"),
+    description: extractTagValue(block, "description"),
+    pubDate: extractTagValue(block, "pubDate"),
+    link: extractTagValue(block, "link"),
+  };
+}
+
+function buildIncidentFromAtomBlock(block) {
+  return {
+    title: extractTagValue(block, "title"),
+    description:
+      extractTagValue(block, "summary") ||
+      extractTagValue(block, "content") ||
+      extractTagValue(block, "description"),
+    pubDate:
+      extractTagValue(block, "updated") ||
+      extractTagValue(block, "published") ||
+      extractTagValue(block, "pubDate"),
+    link: extractAtomLink(block) || extractTagValue(block, "link"),
+  };
 }
 
 function translateToRomanian(input, options = {}) {
@@ -419,6 +440,24 @@ function extractTagValue(block, tagName) {
   }
 
   return normalizeWhitespace(decodeXmlEntities(removeCdata(match[1] || "")));
+}
+
+function extractAtomLink(block) {
+  if (!block) {
+    return "";
+  }
+
+  const alternateMatch = block.match(/<link\b[^>]*\brel=["']alternate["'][^>]*\bhref=["']([^"']+)["'][^>]*\/?>/i);
+  if (alternateMatch?.[1]) {
+    return normalizeWhitespace(decodeXmlEntities(alternateMatch[1]));
+  }
+
+  const hrefMatch = block.match(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*\/?>/i);
+  if (hrefMatch?.[1]) {
+    return normalizeWhitespace(decodeXmlEntities(hrefMatch[1]));
+  }
+
+  return "";
 }
 
 function findStatusInText(text) {
