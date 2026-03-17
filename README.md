@@ -2,11 +2,11 @@
 
 Worker Cloudflare production-ready care:
 
-- preia feed-ul RSS StackStatus
+- preia surse externe de status in acelasi Worker
 - parseaza XML fara librarii externe
 - traduce automat continutul in romana cu Workers AI
-- detecteaza ultimul incident nou cu KV
-- trimite incidentul in Instatus
+- detecteaza intrarile noi cu KV, separat pe fiecare sursa
+- trimite incidentele in Instatus si actualizeaza acelasi incident cand apar note noi sau rezolvare
 - returneaza JSON sigur, fara exceptii necapturate
 
 ## Fisiere
@@ -16,14 +16,15 @@ Worker Cloudflare production-ready care:
 
 ## Ce face Worker-ul
 
-1. Cere feed-ul public de la `https://www.stackstatus.com/rss`, adica pagina Stack Status folosita de 20i.
-2. Daca ai un endpoint RSS diferit pentru 20i, il poti seta prin `RSS_URL`.
+1. Poate monitoriza simultan sursa 20i prin `https://www.stackstatus.com/rss` si, optional, o sursa OneUptime precum Upmind.
+2. Pentru 20i foloseste RSS/Atom, iar pentru Upmind foloseste API-ul public OneUptime al status page-ului.
 3. Parseaza manual atat RSS clasic (`<item>`), cat si Atom (`<entry>`), pentru campurile `title`, `description`, `pubDate` sau `updated`, `link`.
-4. Curata HTML-ul din descriere si normalizeaza spatiile.
-5. Traduce automat textul in romana prin Workers AI, iar daca binding-ul AI lipseste sau modelul esueaza, foloseste fallback-ul local pe reguli si dictionar.
-6. Tine cursor in KV pentru ultimul entry procesat din feed si proceseaza doar entry-urile noi.
-7. Coreleaza update-urile `Investigating / Identified / Monitoring / Resolved` pe acelasi incident Instatus.
-8. Returneaza JSON clar in romana.
+4. Normalizeaza intrarile din fiecare sursa intr-un format comun si le proceseaza separat.
+5. Curata HTML-ul din descriere si normalizeaza spatiile.
+6. Traduce automat textul in romana prin Workers AI, iar daca binding-ul AI lipseste sau modelul esueaza, foloseste fallback-ul local pe reguli si dictionar.
+7. Tine cursoare si stari de incident in KV separat pentru fiecare sursa, ca sa nu se calce intre ele.
+8. Coreleaza update-urile `Investigating / Identified / Monitoring / Resolved` pe acelasi incident Instatus.
+9. Returneaza JSON clar in romana.
 
 ## Deploy si configurare
 
@@ -75,9 +76,13 @@ preview_id = "ID_REAL_KV_PREVIEW"
 
 Poti folosi blocul de mai sus doar daca deploy-ezi local cu Wrangler si vrei sa pastrezi binding-ul in fisier. Pentru Connected Builds din Cloudflare, binding-ul din dashboard este de obicei varianta mai sigura.
 
-Cheia folosita de Worker este:
+Cheile folosite de Worker sunt:
 
-- `last_incident`
+- `feed_cursor:20i`
+- `incident_state:20i:*`
+- `source_current_incident:20i`
+- `last_incident` si `last_incident:20i`
+- pentru surse suplimentare, acelasi model cu alt prefix, de exemplu `feed_cursor:upmind`
 
 ### 3. Seteaza secretele
 
@@ -130,6 +135,7 @@ Worker-ul continua sa functioneze si fara binding-ul AI, dar traducerea va cadea
 
 In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifica:
 
+- `ENABLE_20I_SOURCE`
 - `RSS_URL`
 - `RSS_FALLBACK_URL`
 - `TIME_ZONE`
@@ -140,6 +146,13 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `INSTATUS_NOTIFY`
 - `INSTATUS_SHOULD_PUBLISH`
 - `INSTATUS_COMPONENT_IDS`
+- `UPMIND_STATUS_PAGE_ID`
+- `UPMIND_API_BASE_URL`
+- `UPMIND_SOURCE_NAME`
+- `UPMIND_SOURCE_URL`
+- `UPMIND_PUBLIC_STATUS_URL`
+- `UPMIND_HIDE_SOURCE_LINKS`
+- `UPMIND_COMPONENT_IDS`
 - `INSTATUS_COMPONENT_STATUS_INVESTIGATING`
 - `INSTATUS_COMPONENT_STATUS_IDENTIFIED`
 - `INSTATUS_COMPONENT_STATUS_MONITORING`
@@ -202,6 +215,7 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 - `STATUS_KV` - binding KV obligatoriu
 - `INSTATUS_API_KEY` - secret obligatoriu
 - `INSTATUS_PAGE_ID` - obligatoriu
+- `ENABLE_20I_SOURCE` - optional, implicit activ
 - `RSS_URL` - optional
 - `RSS_FALLBACK_URL` - optional
 - `TIME_ZONE` - optional
@@ -211,7 +225,14 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 - `HIDE_SOURCE_LINKS` - optional, ascunde linkurile directe catre `stackstatus.com`
 - `INSTATUS_NOTIFY` - optional
 - `INSTATUS_SHOULD_PUBLISH` - optional
-- `INSTATUS_COMPONENT_IDS` - optional, lista de ID-uri de componente separate prin virgula
+- `INSTATUS_COMPONENT_IDS` - optional, lista de componente afectate de sursa 20i
+- `UPMIND_STATUS_PAGE_ID` - optional, activeaza sursa Upmind / OneUptime cand este setat
+- `UPMIND_API_BASE_URL` - optional, implicit `https://oneuptime.com`
+- `UPMIND_SOURCE_NAME` - optional
+- `UPMIND_SOURCE_URL` - optional
+- `UPMIND_PUBLIC_STATUS_URL` - optional
+- `UPMIND_HIDE_SOURCE_LINKS` - optional
+- `UPMIND_COMPONENT_IDS` - optional, lista de componente afectate doar de sursa Upmind
 - `INSTATUS_COMPONENT_STATUS_INVESTIGATING` - optional
 - `INSTATUS_COMPONENT_STATUS_IDENTIFIED` - optional
 - `INSTATUS_COMPONENT_STATUS_MONITORING` - optional
@@ -226,7 +247,9 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 
 ## Observatie importanta despre Instatus
 
-Sursa monitorizata in acest proiect este Stack Status de la 20i, pe `https://www.stackstatus.com/rss`, nu `stackstatus.net` de la Stack Exchange.
+Sursa implicita monitorizata in acest proiect este Stack Status de la 20i, pe `https://www.stackstatus.com/rss`, nu `stackstatus.net` de la Stack Exchange.
+
+Optional, acelasi Worker poate monitoriza si o a doua sursa OneUptime, de exemplu Upmind, cu un alt `component_id` din aceeasi pagina Instatus.
 
 Worker-ul foloseste endpoint-ul curent de API:
 
@@ -256,6 +279,12 @@ Seteaza in [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) sau
 INSTATUS_COMPONENT_IDS = "component_id_1,component_id_2"
 ```
 
+Pentru o a doua sursa, de exemplu Upmind, folosesti alta variabila:
+
+```toml
+UPMIND_COMPONENT_IDS = "component_id_upmind"
+```
+
 Worker-ul va trimite automat si statusurile componentelor impreuna cu incidentele:
 
 - `INVESTIGATING` -> `MAJOROUTAGE`
@@ -270,7 +299,9 @@ Poti schimba maparea prin:
 - `INSTATUS_COMPONENT_STATUS_MONITORING`
 - `INSTATUS_COMPONENT_STATUS_RESOLVED`
 
-Fara `INSTATUS_COMPONENT_IDS`, incidentele apar in lista de incidente, dar statusul general al paginii poate ramane verde.
+Fara `INSTATUS_COMPONENT_IDS`, incidentele 20i apar in lista de incidente, dar statusul general al paginii poate ramane verde.
+
+Fara `UPMIND_COMPONENT_IDS`, sursa Upmind poate crea incidente, dar nu va colora componenta ei dedicata.
 
 ## Exemple de raspuns
 
@@ -278,12 +309,12 @@ Fara `INSTATUS_COMPONENT_IDS`, incidentele apar in lista de incidente, dar statu
 
 ```json
 {
-  "status": "Incident procesat.",
+  "status": "20i: 1 incident nou creat.",
   "incident": {
     "title": "Investigam rata crescuta de erori pentru Stack Overflow",
     "description": "Investigam rapoartele privind erori intermitente pentru Stack Overflow. Utilizatorii pot intampina probleme la autentificare.",
     "date": "17 martie 2026 la 22:14",
-    "link": "https://www.stackstatus.net/incidents/example"
+    "link": "https://status.zebrabyte.ro"
   }
 }
 ```
@@ -292,12 +323,12 @@ Fara `INSTATUS_COMPONENT_IDS`, incidentele apar in lista de incidente, dar statu
 
 ```json
 {
-  "status": "Nu exista incident nou.",
+  "status": "20i: Nu exista actualizari noi.",
   "incident": {
     "title": "Rezolvat - probleme de autentificare pentru Stack Overflow",
     "description": "Problema a fost rezolvata. Va multumim pentru rabdare.",
     "date": "17 martie 2026 la 21:10",
-    "link": "https://www.stackstatus.net/incidents/example"
+    "link": "https://status.zebrabyte.ro"
   }
 }
 ```
@@ -306,7 +337,7 @@ Fara `INSTATUS_COMPONENT_IDS`, incidentele apar in lista de incidente, dar statu
 
 ```json
 {
-  "status": "Nu au fost gasite elemente RSS valide.",
+  "status": "20i: Preluarea sursei 20i a esuat.",
   "incident": null
 }
 ```
@@ -315,12 +346,12 @@ Fara `INSTATUS_COMPONENT_IDS`, incidentele apar in lista de incidente, dar statu
 
 ```json
 {
-  "status": "Configuratia Instatus lipseste. Seteaza INSTATUS_API_KEY si INSTATUS_PAGE_ID.",
+  "status": "20i: Configuratia Instatus lipseste. Seteaza INSTATUS_API_KEY si INSTATUS_PAGE_ID.",
   "incident": {
     "title": "Investigam probleme de conectivitate",
     "description": "Investigam rapoartele privind probleme de conectivitate.",
     "date": "17 martie 2026 la 20:55",
-    "link": "https://www.stackstatus.net/incidents/example"
+    "link": "https://status.zebrabyte.ro"
   }
 }
 ```
@@ -338,3 +369,4 @@ Fara `INSTATUS_COMPONENT_IDS`, incidentele apar in lista de incidente, dar statu
 - Daca Instatus raspunde cu `429`, Worker-ul respecta un backoff temporar salvat in KV.
 - Worker-ul proceseaza entry-urile noi din feed in ordine si poate face create sau update pe acelasi incident Instatus.
 - Daca `PUBLIC_STATUS_URL` este gol si `HIDE_SOURCE_LINKS=true`, raspunsul public nu mai expune `stackstatus.com`.
+- Fiecare sursa foloseste propriul cursor KV, propria stare de incident si propriile componente Instatus, deci 20i si Upmind nu se suprascriu reciproc.
