@@ -18,7 +18,6 @@ AI_TRANSLATION_MODEL = "@cf/meta/m2m100-1.2b"
 AI_SOURCE_LANG = "english"
 AI_TARGET_LANG = "romanian"
 AI_MAX_INPUT_LENGTH = "3500"
-PUBLIC_STATUS_URL = "https://status.zebrabyte.ro"
 
 [ai]
 binding = "AI"
