@@ -139,6 +139,11 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `HIDE_SOURCE_LINKS`
 - `INSTATUS_NOTIFY`
 - `INSTATUS_SHOULD_PUBLISH`
+- `INSTATUS_COMPONENT_IDS`
+- `INSTATUS_COMPONENT_STATUS_INVESTIGATING`
+- `INSTATUS_COMPONENT_STATUS_IDENTIFIED`
+- `INSTATUS_COMPONENT_STATUS_MONITORING`
+- `INSTATUS_COMPONENT_STATUS_RESOLVED`
 - `AI_TRANSLATION_ENABLED`
 - `AI_TRANSLATION_MODEL`
 - `AI_SOURCE_LANG`
@@ -206,6 +211,11 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 - `HIDE_SOURCE_LINKS` - optional, ascunde linkurile directe catre `stackstatus.com`
 - `INSTATUS_NOTIFY` - optional
 - `INSTATUS_SHOULD_PUBLISH` - optional
+- `INSTATUS_COMPONENT_IDS` - optional, lista de ID-uri de componente separate prin virgula
+- `INSTATUS_COMPONENT_STATUS_INVESTIGATING` - optional
+- `INSTATUS_COMPONENT_STATUS_IDENTIFIED` - optional
+- `INSTATUS_COMPONENT_STATUS_MONITORING` - optional
+- `INSTATUS_COMPONENT_STATUS_RESOLVED` - optional
 - `AI` - binding Workers AI recomandat pentru traducere automata
 - `AI_TRANSLATION_ENABLED` - optional
 - `AI_TRANSLATION_MODEL` - optional
@@ -235,6 +245,32 @@ Intern, maparea ramane:
 - `Identified` -> `Identificat`
 - `Monitoring` -> `Monitorizam`
 - `Resolved` -> `Rezolvat`
+
+### Componente si culori automate in Instatus
+
+Daca vrei ca bannerul de sus si componentele din pagina Instatus sa nu mai ramana verzi, trebuie sa configurezi componente afectate.
+
+Seteaza in [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) sau in dashboard:
+
+```toml
+INSTATUS_COMPONENT_IDS = "component_id_1,component_id_2"
+```
+
+Worker-ul va trimite automat si statusurile componentelor impreuna cu incidentele:
+
+- `INVESTIGATING` -> `MAJOROUTAGE`
+- `IDENTIFIED` -> `PARTIALOUTAGE`
+- `MONITORING` -> `DEGRADEDPERFORMANCE`
+- `RESOLVED` -> `OPERATIONAL`
+
+Poti schimba maparea prin:
+
+- `INSTATUS_COMPONENT_STATUS_INVESTIGATING`
+- `INSTATUS_COMPONENT_STATUS_IDENTIFIED`
+- `INSTATUS_COMPONENT_STATUS_MONITORING`
+- `INSTATUS_COMPONENT_STATUS_RESOLVED`
+
+Fara `INSTATUS_COMPONENT_IDS`, incidentele apar in lista de incidente, dar statusul general al paginii poate ramane verde.
 
 ## Exemple de raspuns
 

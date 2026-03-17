@@ -559,6 +559,48 @@ function sanitizePublicDescription(description, env) {
   );
 }
 
+function getConfiguredComponentIds(env) {
+  const raw = normalizeWhitespace(env?.INSTATUS_COMPONENT_IDS || "");
+  if (!raw) {
+    return [];
+  }
+
+  return raw
+    .split(",")
+    .map((value) => normalizeWhitespace(value))
+    .filter(Boolean);
+}
+
+function mapIncidentToComponentStatus(incidentStatus, env) {
+  const defaults = {
+    INVESTIGATING: "MAJOROUTAGE",
+    IDENTIFIED: "PARTIALOUTAGE",
+    MONITORING: "DEGRADEDPERFORMANCE",
+    RESOLVED: "OPERATIONAL",
+  };
+
+  const overrides = {
+    INVESTIGATING: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_INVESTIGATING || ""),
+    IDENTIFIED: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_IDENTIFIED || ""),
+    MONITORING: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_MONITORING || ""),
+    RESOLVED: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_RESOLVED || ""),
+  };
+
+  return overrides[incidentStatus?.instatus] || defaults[incidentStatus?.instatus] || "DEGRADEDPERFORMANCE";
+}
+
+function applyAffectedComponents(payload, env, incidentStatus) {
+  const componentIds = getConfiguredComponentIds(env);
+  if (!componentIds.length) {
+    return payload;
+  }
+
+  const componentStatus = mapIncidentToComponentStatus(incidentStatus, env);
+  payload.components = componentIds;
+  payload.statuses = componentIds.map(() => componentStatus);
+  return payload;
+}
+
 async function fetchRSS(env) {
   const urls = uniqueValues([
     env?.RSS_URL || DEFAULT_RSS_URL,
@@ -1017,13 +1059,13 @@ async function createInstatusIncident(env, sourceIncident) {
   const pageId = String(env.INSTATUS_PAGE_ID || "").trim();
   const url = `${apiBase}/v1/${encodeURIComponent(pageId)}/incidents`;
 
-  const payload = {
+  const payload = applyAffectedComponents({
     name: sourceIncident.publicIncident.title,
     message: sourceIncident.publicIncident.description,
     status: sourceIncident.status.instatus,
     notify: readBoolean(env.INSTATUS_NOTIFY, false),
     shouldPublish: readBoolean(env.INSTATUS_SHOULD_PUBLISH, true),
-  };
+  }, env, sourceIncident.status);
 
   const startedAt = parseDateToIso(sourceIncident.rawPubDate);
   if (startedAt) {
@@ -1057,13 +1099,11 @@ async function updateExistingInstatusIncident(env, existingState, sourceIncident
   const updateUrl = `${incidentUrl}/incident-updates`;
 
   const startedAt = parseDateToIso(sourceIncident.rawPubDate);
-  const updateIncidentPayload = {
+  const updateIncidentPayload = applyAffectedComponents({
     name: sourceIncident.publicIncident.title,
     status: sourceIncident.status.instatus,
     notify: readBoolean(env.INSTATUS_NOTIFY, false),
-    components: [],
-    statuses: [],
-  };
+  }, env, sourceIncident.status);
 
   if (startedAt) {
     updateIncidentPayload.started = startedAt;
@@ -1074,13 +1114,11 @@ async function updateExistingInstatusIncident(env, existingState, sourceIncident
     return incidentResponse;
   }
 
-  const incidentUpdatePayload = {
+  const incidentUpdatePayload = applyAffectedComponents({
     message: sourceIncident.publicIncident.description,
     status: sourceIncident.status.instatus,
     notify: readBoolean(env.INSTATUS_NOTIFY, false),
-    components: [],
-    statuses: [],
-  };
+  }, env, sourceIncident.status);
 
   const updateResponse = await performInstatusRequest(env, updateUrl, "POST", incidentUpdatePayload);
   if (!updateResponse.ok) {
