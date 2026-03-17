@@ -1,0 +1,21 @@
+name = "stackstatus-ro-sync"
+main = "src/index.js"
+compatibility_date = "2026-03-17"
+
+[vars]
+RSS_URL = "https://www.stackstatus.net/history.rss"
+RSS_FALLBACK_URL = "https://www.stackstatus.com/history.rss"
+TIME_ZONE = "Europe/Bucharest"
+MAX_DESCRIPTION_LENGTH = "1800"
+FETCH_TIMEOUT_MS = "15000"
+INSTATUS_API_BASE_URL = "https://api.instatus.com"
+INSTATUS_NOTIFY = "false"
+INSTATUS_SHOULD_PUBLISH = "true"
+
+[[kv_namespaces]]
+binding = "STATUS_KV"
+id = "INLOCUIESTE_CU_KV_NAMESPACE_ID"
+preview_id = "INLOCUIESTE_CU_KV_PREVIEW_ID"
+
+[triggers]
+crons = ["*/5 * * * *"]
