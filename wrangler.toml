@@ -3,8 +3,8 @@ main = "src/index.js"
 compatibility_date = "2026-03-17"
 
 [vars]
-RSS_URL = "https://www.stackstatus.net/history.rss"
-RSS_FALLBACK_URL = "https://www.stackstatus.com/history.rss"
+RSS_URL = "https://www.stackstatus.com/history.rss"
+RSS_FALLBACK_URL = ""
 TIME_ZONE = "Europe/Bucharest"
 MAX_DESCRIPTION_LENGTH = "1800"
 FETCH_TIMEOUT_MS = "15000"

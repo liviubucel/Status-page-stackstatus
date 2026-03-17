@@ -1,5 +1,5 @@
-const DEFAULT_RSS_URL = "https://www.stackstatus.net/history.rss";
-const DEFAULT_RSS_FALLBACK_URL = "https://www.stackstatus.com/history.rss";
+const DEFAULT_RSS_URL = "https://www.stackstatus.com/history.rss";
+const DEFAULT_RSS_FALLBACK_URL = "";
 const DEFAULT_FETCH_TIMEOUT_MS = 15000;
 const DEFAULT_MAX_DESCRIPTION_LENGTH = 1800;
 const DEFAULT_TIME_ZONE = "Europe/Bucharest";

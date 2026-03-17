@@ -16,8 +16,8 @@ Worker Cloudflare production-ready care:
 
 ## Ce face Worker-ul
 
-1. Cere RSS-ul de la `https://www.stackstatus.net/history.rss`.
-2. Daca feed-ul principal pica, incearca fallback pe `https://www.stackstatus.com/history.rss`.
+1. Cere RSS-ul de la `https://www.stackstatus.com/history.rss`, adica pagina Stack Status folosita de 20i.
+2. Daca ai un endpoint RSS diferit pentru 20i, il poti seta prin `RSS_URL`.
 3. Parseaza manual campurile `title`, `description`, `pubDate`, `link`.
 4. Curata HTML-ul din descriere si normalizeaza spatiile.
 5. Traduce textul in romana prin reguli pentru status si fraze uzuale.
@@ -155,6 +155,8 @@ npx wrangler deploy
 - `INSTATUS_SHOULD_PUBLISH` - optional
 
 ## Observatie importanta despre Instatus
+
+Sursa monitorizata in acest proiect este Stack Status de la 20i, nu `stackstatus.net` de la Stack Exchange.
 
 Worker-ul foloseste endpoint-ul curent de API:
 
