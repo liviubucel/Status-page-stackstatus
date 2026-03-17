@@ -47,6 +47,23 @@ Dupa aceea, pune valorile reale in [`wrangler.toml`](/D:/Apps/Status-page-stacks
 
 ### 2. Leaga KV de Worker
 
+Pentru Cloudflare Workers Builds din dashboard, recomandarea practica este:
+
+1. nu tine ID-urile KV placeholder in `wrangler.toml`
+2. adauga binding-ul direct in Cloudflare Dashboard la Worker
+3. foloseste exact numele de binding `STATUS_KV`
+
+Din Dashboard:
+
+1. `Workers & Pages`
+2. Worker-ul tau
+3. `Settings`
+4. `Bindings`
+5. `Add binding`
+6. tip `KV Namespace`
+7. Variable name: `STATUS_KV`
+8. alege namespace-ul real creat anterior
+
 Binding-ul trebuie sa fie exact:
 
 ```toml
@@ -55,6 +72,8 @@ binding = "STATUS_KV"
 id = "ID_REAL_KV"
 preview_id = "ID_REAL_KV_PREVIEW"
 ```
+
+Poti folosi blocul de mai sus doar daca deploy-ezi local cu Wrangler si vrei sa pastrezi binding-ul in fisier. Pentru Connected Builds din Cloudflare, binding-ul din dashboard este de obicei varianta mai sigura.
 
 Cheia folosita de Worker este:
 
