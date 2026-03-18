@@ -260,22 +260,45 @@ async function processLatestIncident(env, context = {}) {
         primaryIncidentPriority = sourceResult.priority;
       }
 
-      sourceMessages.push(`${source.name}: ${sourceResult.status}`);
+      sourceMessages.push(sourceResult.status);
 
       if (!sourceResult.ok) {
         return buildResult(
-          sourceMessages.join(" | "),
+          buildPublicStatusSummary(sourceMessages),
           sourceResult.incident || primaryIncident,
           sourceResult.httpStatus,
         );
       }
     }
 
-    return buildResult(sourceMessages.join(" | "), primaryIncident, 200);
+    return buildResult(buildPublicStatusSummary(sourceMessages), primaryIncident, 200);
   } catch (error) {
     console.error("Eroare procesare:", sanitizeError(error));
     return buildResult("A aparut o eroare la procesarea incidentului.", null, 500);
   }
+}
+
+function buildPublicStatusSummary(messages) {
+  const normalized = messages
+    .map((message) => normalizeWhitespace(message))
+    .filter(Boolean);
+
+  if (!normalized.length) {
+    return "Nu exista actualizari noi.";
+  }
+
+  const uniqueMessages = [...new Set(normalized)];
+  const meaningfulMessages = uniqueMessages.filter((message) => message !== "Nu exista actualizari noi.");
+
+  if (meaningfulMessages.length === 1) {
+    return meaningfulMessages[0];
+  }
+
+  if (meaningfulMessages.length > 1) {
+    return meaningfulMessages.join(" | ");
+  }
+
+  return uniqueMessages[0];
 }
 
 async function processSource(source, env, context = {}) {
