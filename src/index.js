@@ -10,6 +10,7 @@ const DEFAULT_AI_TARGET_LANG = "romanian";
 const DEFAULT_AI_MAX_INPUT_LENGTH = 3500;
 const DEFAULT_INSTATUS_RETRY_AFTER_SECONDS = 300;
 const DEFAULT_HIDE_SOURCE_LINKS = true;
+const DEFAULT_COMPONENT_STATUS_UPDATES_ENABLED = false;
 const DEFAULT_ONEUPTIME_API_BASE_URL = "https://oneuptime.com";
 const FEED_CURSOR_KEY = "feed_cursor";
 const INCIDENT_STATE_PREFIX = "incident_state:";
@@ -167,6 +168,10 @@ function getConfiguredSources(env) {
       publicStatusUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
       hideSourceLinks: readBoolean(env?.HIDE_SOURCE_LINKS, DEFAULT_HIDE_SOURCE_LINKS),
       componentIdsRaw: normalizeWhitespace(env?.INSTATUS_COMPONENT_IDS || ""),
+      componentStatusUpdatesEnabled: readBoolean(
+        env?.INSTATUS_COMPONENT_UPDATES_ENABLED,
+        DEFAULT_COMPONENT_STATUS_UPDATES_ENABLED,
+      ),
     });
   }
 
@@ -184,6 +189,10 @@ function getConfiguredSources(env) {
         DEFAULT_HIDE_SOURCE_LINKS,
       ),
       componentIdsRaw: normalizeWhitespace(env?.UPMIND_COMPONENT_IDS || ""),
+      componentStatusUpdatesEnabled: readBoolean(
+        env?.UPMIND_COMPONENT_UPDATES_ENABLED,
+        DEFAULT_COMPONENT_STATUS_UPDATES_ENABLED,
+      ),
     });
   }
 
@@ -250,14 +259,26 @@ async function processLatestIncident(env, context = {}) {
 
     let primaryIncident = null;
     let primaryIncidentPriority = -1;
+    let primaryIncidentTimestamp = -1;
     const sourceMessages = [];
 
     for (const source of sources) {
       const sourceResult = await processSource(source, env, context);
 
-      if (sourceResult.incident && sourceResult.priority > primaryIncidentPriority) {
+      const shouldPromoteIncident =
+        sourceResult.incident &&
+        (
+          sourceResult.priority > primaryIncidentPriority ||
+          (
+            sourceResult.priority === primaryIncidentPriority &&
+            sourceResult.incidentTimestamp > primaryIncidentTimestamp
+          )
+        );
+
+      if (shouldPromoteIncident) {
         primaryIncident = sourceResult.incident;
         primaryIncidentPriority = sourceResult.priority;
+        primaryIncidentTimestamp = sourceResult.incidentTimestamp;
       }
 
       sourceMessages.push(sourceResult.status);
@@ -310,6 +331,7 @@ async function processSource(source, env, context = {}) {
       incident: null,
       httpStatus: 502,
       priority: 0,
+      incidentTimestamp: -1,
     };
   }
 
@@ -328,11 +350,13 @@ async function processSource(source, env, context = {}) {
       incident: null,
       httpStatus: 200,
       priority: 0,
+      incidentTimestamp: -1,
     };
   }
 
   const latestIncident = incidents[0];
   const translatedIncident = await buildPublicIncident(latestIncident, env, source);
+  const latestIncidentTimestamp = getIncidentTimestamp(latestIncident.pubDate);
   const cursor = await readFeedCursor(env, source);
   const pendingEntries = getPendingFeedEntries(incidents, cursor);
 
@@ -343,6 +367,7 @@ async function processSource(source, env, context = {}) {
       incident: translatedIncident,
       httpStatus: 200,
       priority: 1,
+      incidentTimestamp: latestIncidentTimestamp,
     };
   }
 
@@ -356,6 +381,7 @@ async function processSource(source, env, context = {}) {
       incident: translatedIncident,
       httpStatus: 200,
       priority: 2,
+      incidentTimestamp: latestIncidentTimestamp,
     };
   }
 
@@ -366,6 +392,7 @@ async function processSource(source, env, context = {}) {
       incident: translatedIncident,
       httpStatus: 500,
       priority: 2,
+      incidentTimestamp: latestIncidentTimestamp,
     };
   }
 
@@ -377,6 +404,7 @@ async function processSource(source, env, context = {}) {
       incident: translatedIncident,
       httpStatus: 200,
       priority: 2,
+      incidentTimestamp: latestIncidentTimestamp,
     };
   }
 
@@ -393,6 +421,7 @@ async function processSource(source, env, context = {}) {
       incident: syncResult.incident || translatedIncident,
       httpStatus: syncResult.statusCode === 429 ? 429 : 502,
       priority: 2,
+      incidentTimestamp: latestIncidentTimestamp,
     };
   }
 
@@ -404,6 +433,7 @@ async function processSource(source, env, context = {}) {
     incident: syncResult.incident || translatedIncident,
     httpStatus: 200,
     priority: 2,
+    incidentTimestamp: latestIncidentTimestamp,
   };
 }
 
@@ -535,6 +565,10 @@ function parseOneUptimeOverview(payload, source) {
     entries.push(buildOneUptimeNoteEntry(note, incidentIndex.get(extractOneUptimeIncidentId(note)), source));
   }
 
+  if (!entries.length) {
+    entries.push(...extractOneUptimeDegradedResourceEntries(overview, payload, source));
+  }
+
   return entries
     .filter((entry) => entry && (entry.entryId || entry.title || entry.description))
     .sort((left, right) => {
@@ -570,6 +604,7 @@ function buildOneUptimeIncidentEntry(incident, source) {
   );
 
   return {
+    sourceKey: incidentId || buildSourceIncidentKey(titleBase, status),
     entryId: incidentId ? `${incidentId}:${incidentDate || "current"}` : buildSyntheticEntryId({
       title: titleBase,
       pubDate: incidentDate,
@@ -598,8 +633,13 @@ function buildOneUptimeNoteEntry(note, parentIncident, source) {
     .filter(Boolean)
     .join(" ");
   const status = inferOneUptimeStatus(titleBase, `${stateText} ${noteBody}`.trim(), Boolean(parentIncident));
+  const incidentSourceKey =
+    extractOneUptimeIncidentId(note) ||
+    extractOneUptimeEntityId(parentIncident) ||
+    buildSourceIncidentKey(titleBase, status);
 
   return {
+    sourceKey: incidentSourceKey,
     entryId: extractOneUptimeEntityId(note) || buildSyntheticEntryId({
       title: titleBase,
       pubDate: extractOneUptimeDate(note, ["postedAt", "updatedAt", "createdAt"]),
@@ -610,6 +650,208 @@ function buildOneUptimeNoteEntry(note, parentIncident, source) {
     pubDate: extractOneUptimeDate(note, ["postedAt", "updatedAt", "createdAt"]) || new Date().toISOString(),
     link: normalizeWhitespace(source?.sourceUrl || ""),
   };
+}
+
+function extractOneUptimeDegradedResourceEntries(overview, payload, source) {
+  const resources = [];
+  const directCollections = [
+    overview?.statusPageResources,
+    payload?.statusPageResources,
+    overview?.resources,
+    payload?.resources,
+    overview?.monitors,
+    payload?.monitors,
+    overview?.services,
+    payload?.services,
+    overview?.components,
+    payload?.components,
+  ];
+
+  for (const collection of directCollections) {
+    if (Array.isArray(collection)) {
+      resources.push(...collection);
+    }
+  }
+
+  const groupedCollections = [
+    overview?.statusPageGroups,
+    payload?.statusPageGroups,
+    overview?.groups,
+    payload?.groups,
+    overview?.resourceGroups,
+    payload?.resourceGroups,
+    overview?.monitorGroups,
+    payload?.monitorGroups,
+  ];
+
+  for (const groups of groupedCollections) {
+    if (!Array.isArray(groups)) {
+      continue;
+    }
+
+    for (const group of groups) {
+      resources.push(...extractOneUptimeResourcesFromGroup(group));
+    }
+  }
+
+  const deduped = [];
+  const seenKeys = new Set();
+
+  for (const resource of resources) {
+    if (!resource || typeof resource !== "object") {
+      continue;
+    }
+
+    const identity =
+      extractOneUptimeEntityId(resource) ||
+      extractOneUptimeText(resource, ["monitorId", "resourceId", "componentId", "serviceId"]) ||
+      extractOneUptimeText(resource, ["name", "title", "displayName", "label"]);
+    const normalizedIdentity = normalizeWhitespace(identity || "").toLowerCase();
+    if (normalizedIdentity && seenKeys.has(normalizedIdentity)) {
+      continue;
+    }
+
+    const entry = buildOneUptimeResourceEntry(resource, source);
+    if (!entry) {
+      continue;
+    }
+
+    if (normalizedIdentity) {
+      seenKeys.add(normalizedIdentity);
+    }
+
+    deduped.push(entry);
+  }
+
+  return deduped;
+}
+
+function extractOneUptimeResourcesFromGroup(group) {
+  if (!group || typeof group !== "object") {
+    return [];
+  }
+
+  const resources = [];
+  const collections = [
+    group.statusPageResources,
+    group.resources,
+    group.monitors,
+    group.services,
+    group.components,
+    group.children,
+    group.items,
+  ];
+
+  for (const collection of collections) {
+    if (Array.isArray(collection)) {
+      resources.push(...collection);
+    }
+  }
+
+  return resources;
+}
+
+function buildOneUptimeResourceEntry(resource, source) {
+  const statusText = [
+    extractOneUptimeText(resource, [
+      "currentStatus.name",
+      "currentStatus.slug",
+      "currentStatus.title",
+      "status.name",
+      "status.slug",
+      "status.title",
+      "status",
+      "currentMonitorStatus.name",
+      "currentMonitorStatus.slug",
+      "currentMonitorStatus.title",
+      "state.name",
+      "state.slug",
+      "state.title",
+    ]),
+    extractOneUptimeText(resource, ["description", "message"]),
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const status = inferOneUptimeResourceStatus(statusText);
+  if (!status?.instatus) {
+    return null;
+  }
+
+  const titleBase =
+    extractOneUptimeText(resource, [
+      "name",
+      "title",
+      "displayName",
+      "label",
+      "monitor.name",
+      "resource.name",
+      "service.name",
+      "component.name",
+      "description",
+    ]) || `Componenta ${source?.name || "externa"}`;
+  const rawStatusLabel =
+    extractOneUptimeText(resource, [
+      "currentStatus.name",
+      "currentStatus.slug",
+      "currentStatus.title",
+      "status.name",
+      "status.slug",
+      "status.title",
+      "status",
+      "currentMonitorStatus.name",
+      "currentMonitorStatus.slug",
+      "currentMonitorStatus.title",
+      "state.name",
+      "state.slug",
+      "state.title",
+    ]) || getEnglishStatusLabel(status);
+  const description =
+    extractOneUptimeText(resource, ["description", "message"]) ||
+    `${titleBase} raporteaza statusul ${rawStatusLabel}.`;
+  const entityId =
+    extractOneUptimeEntityId(resource) ||
+    extractOneUptimeText(resource, ["monitorId", "resourceId", "componentId", "serviceId"]);
+  const resourceDate = extractOneUptimeDate(resource, [
+    "updatedAt",
+    "lastCheckedAt",
+    "lastCheckAt",
+    "checkedAt",
+    "createdAt",
+  ]);
+
+  return {
+    sourceKey: entityId || buildSourceIncidentKey(titleBase, status),
+    entryId: `${entityId || buildSourceIncidentKey(titleBase, status)}:${status.instatus}:${resourceDate || "current"}`,
+    title: formatStatusPrefixedTitle(status, titleBase),
+    description,
+    pubDate: resourceDate || new Date().toISOString(),
+    link: normalizeWhitespace(source?.sourceUrl || ""),
+  };
+}
+
+function inferOneUptimeResourceStatus(text) {
+  const normalized = normalizeWhitespace(text || "").toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (/\b(operational|online|healthy|up|available|running|ok)\b/.test(normalized)) {
+    return null;
+  }
+
+  if (/\b(major outage|outage|down|offline|unavailable|critical|failed|failure)\b/.test(normalized)) {
+    return getStatusRule("investigating");
+  }
+
+  if (/\b(identified|mitigated|acknowledged)\b/.test(normalized)) {
+    return getStatusRule("identified");
+  }
+
+  if (/\b(monitoring|degraded|degradation|partial outage|partial|warning|maintenance|slow|latency|performance)\b/.test(normalized)) {
+    return getStatusRule("monitoring");
+  }
+
+  return null;
 }
 
 async function buildSyntheticResolvedIncidentsForSource(source, env) {
@@ -623,6 +865,7 @@ async function buildSyntheticResolvedIncidentsForSource(source, env) {
     .map((item) => {
       const baseTitle = buildResolvedBaseTitle(item.lastTitle, item.sourceKey);
       return {
+        sourceKey: item.sourceKey || buildSourceIncidentKey(baseTitle, getStatusRule("resolved")),
         entryId: `resolved:${source.id}:${item.sourceKey}:${item.lastFeedEntryId || item.updatedAt || Date.now()}`,
         title: `Resolved - ${baseTitle}`,
         description: `${source.name} nu mai raporteaza incidente active. Incidentul anterior este tratat ca rezolvat automat.`,
@@ -704,7 +947,7 @@ async function buildSourceIncident(entry, env, source) {
     rawPubDate: entry.pubDate || "",
     rawLink: entry.link || "",
     status,
-    sourceKey: buildSourceIncidentKey(entry.title, status),
+    sourceKey: normalizeWhitespace(entry.sourceKey || "") || buildSourceIncidentKey(entry.title, status),
     publicIncident,
   };
 }
@@ -1222,6 +1465,10 @@ function mapIncidentToComponentStatus(incidentStatus, env) {
 }
 
 function applyAffectedComponents(payload, env, incidentStatus, source) {
+  if (!source?.componentStatusUpdatesEnabled) {
+    return payload;
+  }
+
   const componentIds = getConfiguredComponentIds(source);
   if (!componentIds.length) {
     return payload;
@@ -2029,6 +2276,11 @@ function parseDateToIso(pubDate) {
 function getFetchTimeout(env) {
   const parsed = Number.parseInt(env?.FETCH_TIMEOUT_MS, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_FETCH_TIMEOUT_MS;
+}
+
+function getIncidentTimestamp(pubDate) {
+  const parsed = Date.parse(pubDate || "");
+  return Number.isFinite(parsed) ? parsed : -1;
 }
 
 function getMaxDescriptionLength(env) {

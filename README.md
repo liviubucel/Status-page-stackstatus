@@ -146,6 +146,7 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `INSTATUS_NOTIFY`
 - `INSTATUS_SHOULD_PUBLISH`
 - `INSTATUS_COMPONENT_IDS`
+- `INSTATUS_COMPONENT_UPDATES_ENABLED`
 - `UPMIND_STATUS_PAGE_ID`
 - `UPMIND_API_BASE_URL`
 - `UPMIND_SOURCE_NAME`
@@ -153,6 +154,7 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `UPMIND_PUBLIC_STATUS_URL`
 - `UPMIND_HIDE_SOURCE_LINKS`
 - `UPMIND_COMPONENT_IDS`
+- `UPMIND_COMPONENT_UPDATES_ENABLED`
 - `INSTATUS_COMPONENT_STATUS_INVESTIGATING`
 - `INSTATUS_COMPONENT_STATUS_IDENTIFIED`
 - `INSTATUS_COMPONENT_STATUS_MONITORING`
@@ -226,6 +228,7 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 - `INSTATUS_NOTIFY` - optional
 - `INSTATUS_SHOULD_PUBLISH` - optional
 - `INSTATUS_COMPONENT_IDS` - optional, lista de componente afectate de sursa 20i
+- `INSTATUS_COMPONENT_UPDATES_ENABLED` - optional, implicit `false`; daca este `false`, Worker-ul creeaza si actualizeaza incidente in Instatus fara sa rescrie statusul componentelor
 - `UPMIND_STATUS_PAGE_ID` - optional, activeaza sursa Upmind / OneUptime cand este setat
 - `UPMIND_API_BASE_URL` - optional, implicit `https://oneuptime.com`
 - `UPMIND_SOURCE_NAME` - optional
@@ -233,6 +236,7 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 - `UPMIND_PUBLIC_STATUS_URL` - optional
 - `UPMIND_HIDE_SOURCE_LINKS` - optional
 - `UPMIND_COMPONENT_IDS` - optional, lista de componente afectate doar de sursa Upmind
+- `UPMIND_COMPONENT_UPDATES_ENABLED` - optional, implicit `false`; controleaza separat daca sursa Upmind are voie sa modifice statusul componentelor din Instatus
 - `INSTATUS_COMPONENT_STATUS_INVESTIGATING` - optional
 - `INSTATUS_COMPONENT_STATUS_IDENTIFIED` - optional
 - `INSTATUS_COMPONENT_STATUS_MONITORING` - optional
@@ -250,6 +254,8 @@ Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST s
 Sursa implicita monitorizata in acest proiect este Stack Status de la 20i, pe `https://www.stackstatus.com/rss`, nu `stackstatus.net` de la Stack Exchange.
 
 Optional, acelasi Worker poate monitoriza si o a doua sursa OneUptime, de exemplu Upmind, cu un alt `component_id` din aceeasi pagina Instatus.
+
+Worker-ul nu citeste incidentele create direct in Instatus si nu incearca sa le reconcilieze. El tine propria stare in KV si doar creeaza sau actualizeaza incidentele pe care le gestioneaza automat din sursele externe.
 
 Worker-ul foloseste endpoint-ul curent de API:
 
