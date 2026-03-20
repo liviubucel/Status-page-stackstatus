@@ -227,12 +227,29 @@ async function handleRequest(_request, env) {
   const requestUrl = new URL(_request.url);
   const isManualSync = requestUrl.searchParams.get("sync") === "1";
   const providedToken = requestUrl.searchParams.get("token") || "";
+  const isDiagnosticRequest = requestUrl.searchParams.get("diagnostic") === "1";
   const allowManualSync = Boolean(
     isManualSync &&
       env.MANUAL_SYNC_TOKEN &&
       providedToken &&
       providedToken === env.MANUAL_SYNC_TOKEN,
   );
+
+  if (allowManualSync && isDiagnosticRequest) {
+    const result = await processDiagnosticIncident(env, {
+      requestedStatus: requestUrl.searchParams.get("status") || "",
+      title: requestUrl.searchParams.get("title") || "",
+      description: requestUrl.searchParams.get("message") || requestUrl.searchParams.get("description") || "",
+    });
+
+    return jsonResponse(
+      {
+        status: result.status,
+        incident: result.incident,
+      },
+      result.httpStatus,
+    );
+  }
 
   const result = await processLatestIncident(env, {
     source: "http",
@@ -244,6 +261,80 @@ async function handleRequest(_request, env) {
       incident: result.incident,
     },
     result.httpStatus,
+  );
+}
+
+async function processDiagnosticIncident(env, options = {}) {
+  if (!env || !env.STATUS_KV || typeof env.STATUS_KV.get !== "function" || typeof env.STATUS_KV.put !== "function") {
+    return buildResult("Binding-ul STATUS_KV nu este configurat.", null, 500);
+  }
+
+  if (!env.INSTATUS_API_KEY || !env.INSTATUS_PAGE_ID) {
+    return buildResult("Configuratia Instatus lipseste. Seteaza INSTATUS_API_KEY si INSTATUS_PAGE_ID.", null, 500);
+  }
+
+  const diagnosticStatus = parseDiagnosticStatus(options.requestedStatus);
+  if (!diagnosticStatus) {
+    return buildResult(
+      "Statusul de diagnostic este invalid. Foloseste: investigating, identified, monitoring sau resolved.",
+      null,
+      400,
+    );
+  }
+
+  const source = {
+    id: "diagnostic",
+    name: "Diagnostic",
+    type: "manual",
+    sourceUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
+    publicStatusUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
+    hideSourceLinks: true,
+    componentIdsRaw: "",
+    componentStatusUpdatesEnabled: false,
+  };
+  const rawTitle = normalizeWhitespace(options.title || "") || "Diagnostic banner test";
+  const entry = {
+    sourceKey: "diagnostic-banner-test",
+    entryId: `diagnostic:${diagnosticStatus.instatus}:${Date.now()}`,
+    title: formatStatusPrefixedTitle(diagnosticStatus, rawTitle),
+    description:
+      normalizeWhitespace(options.description || "") ||
+      buildDiagnosticDescription(diagnosticStatus),
+    pubDate: new Date().toISOString(),
+    link: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
+  };
+  const sourceIncident = await buildSourceIncident(entry, env, source);
+  const existingState = await readIncidentState(env, source, sourceIncident.sourceKey);
+
+  if (diagnosticStatus.key === "resolved" && !existingState?.instatusIncidentId) {
+    return buildResult(
+      "Nu exista un incident de diagnostic activ. Ruleaza mai intai un test cu investigating, identified sau monitoring.",
+      sourceIncident.publicIncident,
+      409,
+    );
+  }
+
+  const action =
+    existingState?.instatusIncidentId && existingState.currentStatus !== "RESOLVED" ? "update" : "create";
+  const syncResult =
+    action === "create"
+      ? await createInstatusIncident(env, sourceIncident)
+      : await updateExistingInstatusIncident(env, existingState, sourceIncident);
+
+  if (!syncResult.ok) {
+    return buildResult(syncResult.message || "Testul de diagnostic a esuat.", sourceIncident.publicIncident, 502);
+  }
+
+  await writeIncidentState(env, source, sourceIncident, syncResult.incidentId);
+  await writeFeedCursor(env, source, sourceIncident);
+  await writeLastIncident(env, source, sourceIncident);
+
+  return buildResult(
+    diagnosticStatus.key === "resolved"
+      ? "Incidentul de diagnostic a fost marcat ca rezolvat."
+      : `Incidentul de diagnostic a fost ${action === "create" ? "creat" : "actualizat"} cu statusul ${diagnosticStatus.translated}.`,
+    sourceIncident.publicIncident,
+    200,
   );
 }
 
@@ -1303,6 +1394,41 @@ function inferOneUptimeStatus(title, description, isActiveIncident = false) {
 
 function getStatusRule(key) {
   return STATUS_RULES.find((rule) => rule.key === key) || null;
+}
+
+function parseDiagnosticStatus(value) {
+  const normalized = normalizeWhitespace(value || "").toLowerCase();
+  if (!normalized) {
+    return getStatusRule("investigating");
+  }
+
+  const aliasMap = {
+    investigating: "investigating",
+    investigate: "investigating",
+    identified: "identified",
+    identify: "identified",
+    monitoring: "monitoring",
+    monitor: "monitoring",
+    resolved: "resolved",
+    resolve: "resolved",
+  };
+
+  const key = aliasMap[normalized] || "";
+  return key ? getStatusRule(key) : null;
+}
+
+function buildDiagnosticDescription(status) {
+  switch (status?.key) {
+    case "identified":
+      return "Test manual pentru verificarea bannerului general din Instatus. Problema a fost identificata.";
+    case "monitoring":
+      return "Test manual pentru verificarea bannerului general din Instatus. Sistemul este monitorizat dupa remediere.";
+    case "resolved":
+      return "Test manual pentru verificarea bannerului general din Instatus. Incidentul de diagnostic este rezolvat.";
+    case "investigating":
+    default:
+      return "Test manual pentru verificarea bannerului general din Instatus. Investigam o problema simulata.";
+  }
 }
 
 function extractMarkdownHeading(text) {

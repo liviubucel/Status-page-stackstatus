@@ -212,6 +212,31 @@ https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU
 
 Fara `token` corect, Worker-ul doar afiseaza incidentul curent si nu face POST spre Instatus.
 
+### Test manual pentru bannerul de sus
+
+Poti testa fara sa astepti un incident real, folosind acelasi token de manual sync:
+
+```text
+https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU&diagnostic=1&status=investigating&title=Test%20banner
+```
+
+Statusuri acceptate:
+
+- `investigating`
+- `identified`
+- `monitoring`
+- `resolved`
+
+Exemple:
+
+```text
+https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU&diagnostic=1&status=investigating&title=Test%20banner
+https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU&diagnostic=1&status=monitoring&title=Test%20banner
+https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU&diagnostic=1&status=resolved&title=Test%20banner
+```
+
+Asta creeaza sau actualizeaza un singur incident de diagnostic in Instatus, separat de sursele externe, ca sa poti verifica daca bannerul general al paginii se schimba.
+
 ## Variabile folosite
 
 - `STATUS_KV` - binding KV obligatoriu
