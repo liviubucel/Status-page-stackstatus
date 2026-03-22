@@ -319,8 +319,13 @@ async function processDiagnosticIncident(env, options = {}) {
     sourceUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
     publicStatusUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
     hideSourceLinks: true,
-    componentIdsRaw: "",
-    componentStatusUpdatesEnabled: false,
+    componentIdsRaw: normalizeWhitespace(env?.STATUSPAGE_COMPONENT_IDS || env?.INSTATUS_COMPONENT_IDS || ""),
+    componentStatusUpdatesEnabled: readBoolean(
+      typeof env?.STATUSPAGE_COMPONENT_UPDATES_ENABLED === "string"
+        ? env.STATUSPAGE_COMPONENT_UPDATES_ENABLED
+        : env?.INSTATUS_COMPONENT_UPDATES_ENABLED,
+      DEFAULT_COMPONENT_STATUS_UPDATES_ENABLED,
+    ),
   };
   const rawTitle = normalizeWhitespace(options.title || "") || "Diagnostic banner test";
   const entry = {
