@@ -8,38 +8,41 @@ const DEFAULT_AI_TRANSLATION_ENABLED = true;
 const DEFAULT_AI_SOURCE_LANG = "english";
 const DEFAULT_AI_TARGET_LANG = "romanian";
 const DEFAULT_AI_MAX_INPUT_LENGTH = 3500;
-const DEFAULT_INSTATUS_RETRY_AFTER_SECONDS = 300;
+const DEFAULT_STATUSPAGE_RETRY_AFTER_SECONDS = 300;
+const DEFAULT_STATUSPAGE_API_BASE_URL = "https://api.statuspage.io";
 const DEFAULT_HIDE_SOURCE_LINKS = true;
 const DEFAULT_COMPONENT_STATUS_UPDATES_ENABLED = false;
 const DEFAULT_ONEUPTIME_API_BASE_URL = "https://oneuptime.com";
 const FEED_CURSOR_KEY = "feed_cursor";
 const INCIDENT_STATE_PREFIX = "incident_state:";
 const SOURCE_CURRENT_INCIDENT_PREFIX = "source_current_incident:";
+const STATUSPAGE_RATE_LIMIT_KEY = "statuspage_rate_limited_until";
+let lastStatuspageRequestAt = 0;
 
 const STATUS_RULES = [
   {
     key: "investigating",
     keywords: ["investigating"],
     translated: "Investigam",
-    instatus: "INVESTIGATING",
+    statuspage: "investigating",
   },
   {
     key: "identified",
     keywords: ["identified"],
     translated: "Identificat",
-    instatus: "IDENTIFIED",
+    statuspage: "identified",
   },
   {
     key: "monitoring",
     keywords: ["monitoring"],
     translated: "Monitorizam",
-    instatus: "MONITORING",
+    statuspage: "monitoring",
   },
   {
     key: "resolved",
     keywords: ["resolved"],
     translated: "Rezolvat",
-    instatus: "RESOLVED",
+    statuspage: "resolved",
   },
 ];
 
@@ -167,9 +170,11 @@ function getConfiguredSources(env) {
       sourceUrl: "https://www.stackstatus.com",
       publicStatusUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
       hideSourceLinks: readBoolean(env?.HIDE_SOURCE_LINKS, DEFAULT_HIDE_SOURCE_LINKS),
-      componentIdsRaw: normalizeWhitespace(env?.INSTATUS_COMPONENT_IDS || ""),
+      componentIdsRaw: normalizeWhitespace(env?.STATUSPAGE_COMPONENT_IDS || env?.INSTATUS_COMPONENT_IDS || ""),
       componentStatusUpdatesEnabled: readBoolean(
-        env?.INSTATUS_COMPONENT_UPDATES_ENABLED,
+        typeof env?.STATUSPAGE_COMPONENT_UPDATES_ENABLED === "string"
+          ? env.STATUSPAGE_COMPONENT_UPDATES_ENABLED
+          : env?.INSTATUS_COMPONENT_UPDATES_ENABLED,
         DEFAULT_COMPONENT_STATUS_UPDATES_ENABLED,
       ),
     });
@@ -207,6 +212,27 @@ function getConfiguredSources(env) {
 
     return false;
   });
+}
+
+function getStatuspageConfig(env) {
+  return {
+    apiBaseUrl: normalizeWhitespace(
+      env?.STATUSPAGE_API_BASE_URL || env?.INSTATUS_API_BASE_URL || DEFAULT_STATUSPAGE_API_BASE_URL,
+    ).replace(/\/+$/, ""),
+    apiKey: normalizeWhitespace(env?.STATUSPAGE_API_KEY || env?.INSTATUS_API_KEY || ""),
+    pageId: normalizeWhitespace(env?.STATUSPAGE_PAGE_ID || env?.INSTATUS_PAGE_ID || ""),
+    deliverNotifications: readBoolean(
+      typeof env?.STATUSPAGE_DELIVER_NOTIFICATIONS === "string"
+        ? env.STATUSPAGE_DELIVER_NOTIFICATIONS
+        : env?.INSTATUS_NOTIFY,
+      false,
+    ),
+  };
+}
+
+function hasStatuspageCredentials(env) {
+  const config = getStatuspageConfig(env);
+  return Boolean(config.apiKey && config.pageId);
 }
 
 async function runScheduled(env, event) {
@@ -269,8 +295,12 @@ async function processDiagnosticIncident(env, options = {}) {
     return buildResult("Binding-ul STATUS_KV nu este configurat.", null, 500);
   }
 
-  if (!env.INSTATUS_API_KEY || !env.INSTATUS_PAGE_ID) {
-    return buildResult("Configuratia Instatus lipseste. Seteaza INSTATUS_API_KEY si INSTATUS_PAGE_ID.", null, 500);
+  if (!hasStatuspageCredentials(env)) {
+    return buildResult(
+      "Configuratia Statuspage lipseste. Seteaza STATUSPAGE_API_KEY si STATUSPAGE_PAGE_ID.",
+      null,
+      500,
+    );
   }
 
   const diagnosticStatus = parseDiagnosticStatus(options.requestedStatus);
@@ -295,7 +325,7 @@ async function processDiagnosticIncident(env, options = {}) {
   const rawTitle = normalizeWhitespace(options.title || "") || "Diagnostic banner test";
   const entry = {
     sourceKey: "diagnostic-banner-test",
-    entryId: `diagnostic:${diagnosticStatus.instatus}:${Date.now()}`,
+    entryId: `diagnostic:${diagnosticStatus.statuspage}:${Date.now()}`,
     title: formatStatusPrefixedTitle(diagnosticStatus, rawTitle),
     description:
       normalizeWhitespace(options.description || "") ||
@@ -306,7 +336,7 @@ async function processDiagnosticIncident(env, options = {}) {
   const sourceIncident = await buildSourceIncident(entry, env, source);
   const existingState = await readIncidentState(env, source, sourceIncident.sourceKey);
 
-  if (diagnosticStatus.key === "resolved" && !existingState?.instatusIncidentId) {
+  if (diagnosticStatus.key === "resolved" && !getStoredIncidentId(existingState)) {
     return buildResult(
       "Nu exista un incident de diagnostic activ. Ruleaza mai intai un test cu investigating, identified sau monitoring.",
       sourceIncident.publicIncident,
@@ -315,11 +345,11 @@ async function processDiagnosticIncident(env, options = {}) {
   }
 
   const action =
-    existingState?.instatusIncidentId && existingState.currentStatus !== "RESOLVED" ? "update" : "create";
+    getStoredIncidentId(existingState) && !isResolvedIncidentStatus(existingState.currentStatus) ? "update" : "create";
   const syncResult =
     action === "create"
-      ? await createInstatusIncident(env, sourceIncident)
-      : await updateExistingInstatusIncident(env, existingState, sourceIncident);
+      ? await createStatuspageIncident(env, sourceIncident)
+      : await updateExistingStatuspageIncident(env, existingState, sourceIncident);
 
   if (!syncResult.ok) {
     return buildResult(syncResult.message || "Testul de diagnostic a esuat.", sourceIncident.publicIncident, 502);
@@ -476,10 +506,10 @@ async function processSource(source, env, context = {}) {
     };
   }
 
-  if (!env.INSTATUS_API_KEY || !env.INSTATUS_PAGE_ID) {
+  if (!hasStatuspageCredentials(env)) {
     return {
       ok: false,
-      status: "Configuratia Instatus lipseste. Seteaza INSTATUS_API_KEY si INSTATUS_PAGE_ID.",
+      status: "Configuratia Statuspage lipseste. Seteaza STATUSPAGE_API_KEY si STATUSPAGE_PAGE_ID.",
       incident: translatedIncident,
       httpStatus: 500,
       priority: 2,
@@ -487,11 +517,11 @@ async function processSource(source, env, context = {}) {
     };
   }
 
-  const backoffCheck = await readInstatusBackoff(env);
+  const backoffCheck = await readStatuspageBackoff(env);
   if (backoffCheck.active) {
     return {
       ok: true,
-      status: `Instatus limiteaza temporar cererile. Urmatoarea incercare dupa ${backoffCheck.untilFormatted}.`,
+      status: `Statuspage limiteaza temporar cererile. Urmatoarea incercare dupa ${backoffCheck.untilFormatted}.`,
       incident: translatedIncident,
       httpStatus: 200,
       priority: 2,
@@ -501,22 +531,22 @@ async function processSource(source, env, context = {}) {
 
   const syncResult = await syncPendingFeedEntries(env, source, pendingEntries);
   if (!syncResult.ok) {
-    if (syncResult.statusCode === 429) {
-      const retryAfterSeconds = syncResult.retryAfterSeconds || DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
-      await writeInstatusBackoff(env, retryAfterSeconds);
+    if (isStatuspageRateLimitedStatus(syncResult.statusCode)) {
+      const retryAfterSeconds = syncResult.retryAfterSeconds || DEFAULT_STATUSPAGE_RETRY_AFTER_SECONDS;
+      await writeStatuspageBackoff(env, retryAfterSeconds);
     }
 
     return {
       ok: false,
-      status: syncResult.message ?? "Sincronizarea catre Instatus a esuat.",
+      status: syncResult.message ?? "Sincronizarea catre Statuspage a esuat.",
       incident: syncResult.incident || translatedIncident,
-      httpStatus: syncResult.statusCode === 429 ? 429 : 502,
+      httpStatus: isStatuspageRateLimitedStatus(syncResult.statusCode) ? 429 : 502,
       priority: 2,
       incidentTimestamp: latestIncidentTimestamp,
     };
   }
 
-  await clearInstatusBackoff(env);
+  await clearStatuspageBackoff(env);
 
   return {
     ok: true,
@@ -864,7 +894,7 @@ function buildOneUptimeResourceEntry(resource, source) {
     .filter(Boolean)
     .join(" ");
   const status = inferOneUptimeResourceStatus(statusText);
-  if (!status?.instatus) {
+  if (!status?.statuspage) {
     return null;
   }
 
@@ -912,7 +942,7 @@ function buildOneUptimeResourceEntry(resource, source) {
 
   return {
     sourceKey: entityId || buildSourceIncidentKey(titleBase, status),
-    entryId: `${entityId || buildSourceIncidentKey(titleBase, status)}:${status.instatus}:${resourceDate || "current"}`,
+    entryId: `${entityId || buildSourceIncidentKey(titleBase, status)}:${status.statuspage}:${resourceDate || "current"}`,
     title: formatStatusPrefixedTitle(status, titleBase),
     description,
     pubDate: resourceDate || new Date().toISOString(),
@@ -952,7 +982,7 @@ async function buildSyntheticResolvedIncidentsForSource(source, env) {
   }
 
   return currentIncidents
-    .filter((item) => item?.sourceKey && item.currentStatus && item.currentStatus !== "RESOLVED")
+    .filter((item) => item?.sourceKey && item.currentStatus && !isResolvedIncidentStatus(item.currentStatus))
     .map((item) => {
       const baseTitle = buildResolvedBaseTitle(item.lastTitle, item.sourceKey);
       return {
@@ -977,14 +1007,14 @@ async function syncPendingFeedEntries(env, source, entries) {
     const sourceIncident = await buildSourceIncident(entry, env, source);
     latestPublicIncident = sourceIncident.publicIncident;
 
-    if (!sourceIncident.status.instatus) {
+    if (!sourceIncident.status.statuspage) {
       await writeFeedCursor(env, source, sourceIncident);
       skippedCount += 1;
       continue;
     }
 
     const existingState = await readIncidentState(env, source, sourceIncident.sourceKey);
-    const action = determineInstatusAction(existingState, sourceIncident);
+    const action = determineStatuspageAction(existingState, sourceIncident);
 
     if (action === "skip") {
       await writeFeedCursor(env, source, sourceIncident);
@@ -994,9 +1024,9 @@ async function syncPendingFeedEntries(env, source, entries) {
 
     let syncResult;
     if (action === "create") {
-      syncResult = await createInstatusIncident(env, sourceIncident);
+      syncResult = await createStatuspageIncident(env, sourceIncident);
     } else {
-      syncResult = await updateExistingInstatusIncident(env, existingState, sourceIncident);
+      syncResult = await updateExistingStatuspageIncident(env, existingState, sourceIncident);
     }
 
     if (!syncResult.ok) {
@@ -1012,7 +1042,7 @@ async function syncPendingFeedEntries(env, source, entries) {
 
     if (action === "create") {
       createdCount += 1;
-    } else if (sourceIncident.status.instatus === "RESOLVED") {
+    } else if (sourceIncident.status.statuspage === "resolved") {
       resolvedCount += 1;
     } else {
       updatedCount += 1;
@@ -1070,8 +1100,20 @@ async function buildPublicIncident(entry, env, source, statusHint = null) {
   return incident;
 }
 
-function determineInstatusAction(existingState, sourceIncident) {
-  if (!existingState?.instatusIncidentId) {
+function getStoredIncidentId(existingState) {
+  return normalizeWhitespace(existingState?.statuspageIncidentId || existingState?.instatusIncidentId || "");
+}
+
+function normalizeIncidentStatusValue(status) {
+  return normalizeWhitespace(String(status || "")).toLowerCase();
+}
+
+function isResolvedIncidentStatus(status) {
+  return normalizeIncidentStatusValue(status) === "resolved";
+}
+
+function determineStatuspageAction(existingState, sourceIncident) {
+  if (!getStoredIncidentId(existingState)) {
     return "create";
   }
 
@@ -1079,7 +1121,7 @@ function determineInstatusAction(existingState, sourceIncident) {
     return "skip";
   }
 
-  if (existingState.currentStatus === "RESOLVED") {
+  if (isResolvedIncidentStatus(existingState.currentStatus)) {
     return "create";
   }
 
@@ -1106,7 +1148,7 @@ function buildSyncSummaryMessage(createdCount, updatedCount, resolvedCount, skip
   }
 
   if (!parts.length) {
-    return "Nu a fost necesara nicio modificare in Instatus.";
+    return "Nu a fost necesara nicio modificare in Statuspage.";
   }
 
   return `${parts.join(", ")}.`;
@@ -1186,8 +1228,8 @@ async function readIncidentState(env, source, sourceKey) {
   }
 }
 
-async function writeIncidentState(env, source, sourceIncident, instatusIncidentId) {
-  if (!sourceIncident?.sourceKey || !instatusIncidentId) {
+async function writeIncidentState(env, source, sourceIncident, statuspageIncidentId) {
+  if (!sourceIncident?.sourceKey || !statuspageIncidentId) {
     return;
   }
 
@@ -1195,8 +1237,8 @@ async function writeIncidentState(env, source, sourceIncident, instatusIncidentI
     sourceId: source.id,
     sourceName: source.name,
     sourceKey: sourceIncident.sourceKey,
-    instatusIncidentId,
-    currentStatus: sourceIncident.status.instatus,
+    statuspageIncidentId,
+    currentStatus: sourceIncident.status.statuspage,
     lastFeedEntryId: sourceIncident.entryId,
     lastFeedEntryDate: sourceIncident.rawPubDate || "",
     lastTitle: sourceIncident.rawTitle || "",
@@ -1248,7 +1290,7 @@ async function readCurrentIncidentsForSource(env, source) {
 async function updateCurrentIncidentsForSource(env, source, incidentState) {
   const index = await readCurrentIncidentIndexForSource(env, source);
 
-  if (incidentState.currentStatus === "RESOLVED") {
+  if (isResolvedIncidentStatus(incidentState.currentStatus)) {
     delete index[incidentState.sourceKey];
   } else {
     index[incidentState.sourceKey] = incidentState;
@@ -1364,7 +1406,7 @@ function getEnglishStatusLabel(status) {
 
 function inferOneUptimeStatus(title, description, isActiveIncident = false) {
   const mapped = mapStatus(title, description);
-  if (mapped?.instatus) {
+  if (mapped?.statuspage) {
     return mapped;
   }
 
@@ -1388,7 +1430,7 @@ function inferOneUptimeStatus(title, description, isActiveIncident = false) {
   return {
     key: "necunoscut",
     translated: "Actualizare incident",
-    instatus: null,
+    statuspage: null,
   };
 }
 
@@ -1420,14 +1462,14 @@ function parseDiagnosticStatus(value) {
 function buildDiagnosticDescription(status) {
   switch (status?.key) {
     case "identified":
-      return "Test manual pentru verificarea bannerului general din Instatus. Problema a fost identificata.";
+      return "Test manual pentru verificarea bannerului general din Statuspage. Problema a fost identificata.";
     case "monitoring":
-      return "Test manual pentru verificarea bannerului general din Instatus. Sistemul este monitorizat dupa remediere.";
+      return "Test manual pentru verificarea bannerului general din Statuspage. Sistemul este monitorizat dupa remediere.";
     case "resolved":
-      return "Test manual pentru verificarea bannerului general din Instatus. Incidentul de diagnostic este rezolvat.";
+      return "Test manual pentru verificarea bannerului general din Statuspage. Incidentul de diagnostic este rezolvat.";
     case "investigating":
     default:
-      return "Test manual pentru verificarea bannerului general din Instatus. Investigam o problema simulata.";
+      return "Test manual pentru verificarea bannerului general din Statuspage. Investigam o problema simulata.";
   }
 }
 
@@ -1574,20 +1616,32 @@ function getConfiguredComponentIds(source) {
 
 function mapIncidentToComponentStatus(incidentStatus, env) {
   const defaults = {
-    INVESTIGATING: "MAJOROUTAGE",
-    IDENTIFIED: "PARTIALOUTAGE",
-    MONITORING: "DEGRADEDPERFORMANCE",
-    RESOLVED: "OPERATIONAL",
+    investigating: "major_outage",
+    identified: "partial_outage",
+    monitoring: "degraded_performance",
+    resolved: "operational",
   };
 
   const overrides = {
-    INVESTIGATING: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_INVESTIGATING || ""),
-    IDENTIFIED: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_IDENTIFIED || ""),
-    MONITORING: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_MONITORING || ""),
-    RESOLVED: normalizeWhitespace(env?.INSTATUS_COMPONENT_STATUS_RESOLVED || ""),
+    investigating: normalizeWhitespace(
+      env?.STATUSPAGE_COMPONENT_STATUS_INVESTIGATING || env?.INSTATUS_COMPONENT_STATUS_INVESTIGATING || "",
+    ),
+    identified: normalizeWhitespace(
+      env?.STATUSPAGE_COMPONENT_STATUS_IDENTIFIED || env?.INSTATUS_COMPONENT_STATUS_IDENTIFIED || "",
+    ),
+    monitoring: normalizeWhitespace(
+      env?.STATUSPAGE_COMPONENT_STATUS_MONITORING || env?.INSTATUS_COMPONENT_STATUS_MONITORING || "",
+    ),
+    resolved: normalizeWhitespace(
+      env?.STATUSPAGE_COMPONENT_STATUS_RESOLVED || env?.INSTATUS_COMPONENT_STATUS_RESOLVED || "",
+    ),
   };
 
-  return overrides[incidentStatus?.instatus] || defaults[incidentStatus?.instatus] || "DEGRADEDPERFORMANCE";
+  return (
+    overrides[incidentStatus?.statuspage] ||
+    defaults[incidentStatus?.statuspage] ||
+    "degraded_performance"
+  );
 }
 
 function applyAffectedComponents(payload, env, incidentStatus, source) {
@@ -1601,8 +1655,8 @@ function applyAffectedComponents(payload, env, incidentStatus, source) {
   }
 
   const componentStatus = mapIncidentToComponentStatus(incidentStatus, env);
-  payload.components = componentIds;
-  payload.statuses = componentIds.map(() => componentStatus);
+  payload.component_ids = componentIds;
+  payload.components = Object.fromEntries(componentIds.map((componentId) => [componentId, componentStatus]));
   return payload;
 }
 
@@ -1819,7 +1873,7 @@ function mapStatus(title, description) {
   return {
     key: "necunoscut",
     translated: "Actualizare incident",
-    instatus: null,
+    statuspage: null,
   };
 }
 
@@ -1834,16 +1888,21 @@ function prepareTextForTranslation(input, options = {}) {
   return text;
 }
 
-async function readInstatusBackoff(env) {
+async function readStatuspageBackoff(env) {
   try {
-    const value = await env.STATUS_KV.get("instatus_rate_limited_until");
+    const value =
+      (await env.STATUS_KV.get(STATUSPAGE_RATE_LIMIT_KEY)) ||
+      (await env.STATUS_KV.get("instatus_rate_limited_until"));
     if (!value) {
       return { active: false, until: null, untilFormatted: "" };
     }
 
     const until = Number.parseInt(value, 10);
     if (!Number.isFinite(until) || until <= Date.now()) {
-      await env.STATUS_KV.delete("instatus_rate_limited_until");
+      await env.STATUS_KV.delete(STATUSPAGE_RATE_LIMIT_KEY);
+      if (typeof env.STATUS_KV.delete === "function") {
+        await env.STATUS_KV.delete("instatus_rate_limited_until");
+      }
       return { active: false, until: null, untilFormatted: "" };
     }
 
@@ -1853,39 +1912,42 @@ async function readInstatusBackoff(env) {
       untilFormatted: formatTimestampToRomanian(until, env.TIME_ZONE || DEFAULT_TIME_ZONE),
     };
   } catch (error) {
-    console.error("Eroare backoff Instatus:", sanitizeError(error));
+    console.error("Eroare backoff Statuspage:", sanitizeError(error));
     return { active: false, until: null, untilFormatted: "" };
   }
 }
 
-async function writeInstatusBackoff(env, retryAfterSeconds) {
+async function writeStatuspageBackoff(env, retryAfterSeconds) {
   const safeSeconds =
     Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
       ? retryAfterSeconds
-      : DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+      : DEFAULT_STATUSPAGE_RETRY_AFTER_SECONDS;
   const until = Date.now() + safeSeconds * 1000;
 
   try {
-    await env.STATUS_KV.put("instatus_rate_limited_until", String(until), {
+    await env.STATUS_KV.put(STATUSPAGE_RATE_LIMIT_KEY, String(until), {
       expirationTtl: safeSeconds,
     });
   } catch (error) {
-    console.error("Eroare salvare backoff Instatus:", sanitizeError(error));
+    console.error("Eroare salvare backoff Statuspage:", sanitizeError(error));
   }
 }
 
-async function clearInstatusBackoff(env) {
+async function clearStatuspageBackoff(env) {
   try {
-    await env.STATUS_KV.delete("instatus_rate_limited_until");
+    await env.STATUS_KV.delete(STATUSPAGE_RATE_LIMIT_KEY);
+    if (typeof env.STATUS_KV.delete === "function") {
+      await env.STATUS_KV.delete("instatus_rate_limited_until");
+    }
   } catch (error) {
-    console.error("Eroare stergere backoff Instatus:", sanitizeError(error));
+    console.error("Eroare stergere backoff Statuspage:", sanitizeError(error));
   }
 }
 
 function getRetryAfterSeconds(response) {
   const header = response.headers.get("Retry-After");
   if (!header) {
-    return DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+    return DEFAULT_STATUSPAGE_RETRY_AFTER_SECONDS;
   }
 
   const seconds = Number.parseInt(header, 10);
@@ -1896,10 +1958,10 @@ function getRetryAfterSeconds(response) {
   const dateValue = Date.parse(header);
   if (Number.isFinite(dateValue)) {
     const deltaSeconds = Math.ceil((dateValue - Date.now()) / 1000);
-    return deltaSeconds > 0 ? deltaSeconds : DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+    return deltaSeconds > 0 ? deltaSeconds : DEFAULT_STATUSPAGE_RETRY_AFTER_SECONDS;
   }
 
-  return DEFAULT_INSTATUS_RETRY_AFTER_SECONDS;
+  return DEFAULT_STATUSPAGE_RETRY_AFTER_SECONDS;
 }
 
 function shouldUseAiTranslation(env) {
@@ -2059,34 +2121,33 @@ function normalizeTranslatedStatusPhrases(text, statusHint) {
   return normalized;
 }
 
-async function createInstatusIncident(env, sourceIncident) {
-  const apiBase = (env.INSTATUS_API_BASE_URL || "https://api.instatus.com").replace(/\/+$/, "");
-  const pageId = String(env.INSTATUS_PAGE_ID || "").trim();
-  const url = `${apiBase}/v1/${encodeURIComponent(pageId)}/incidents`;
+async function createStatuspageIncident(env, sourceIncident) {
+  const config = getStatuspageConfig(env);
+  const url = `${config.apiBaseUrl}/v1/pages/${encodeURIComponent(config.pageId)}/incidents`;
+  const payload = {
+    incident: applyAffectedComponents(
+      {
+        name: sourceIncident.publicIncident.title,
+        body: sourceIncident.publicIncident.description,
+        status: sourceIncident.status.statuspage,
+        deliver_notifications: config.deliverNotifications,
+      },
+      env,
+      sourceIncident.status,
+      sourceIncident.source,
+    ),
+  };
 
-  const payload = applyAffectedComponents({
-    name: sourceIncident.publicIncident.title,
-    message: sourceIncident.publicIncident.description,
-    status: sourceIncident.status.instatus,
-    notify: readBoolean(env.INSTATUS_NOTIFY, false),
-    shouldPublish: readBoolean(env.INSTATUS_SHOULD_PUBLISH, true),
-  }, env, sourceIncident.status, sourceIncident.source);
-
-  const startedAt = parseDateToIso(sourceIncident.rawPubDate);
-  if (startedAt) {
-    payload.started = startedAt;
-  }
-
-  const response = await performInstatusRequest(env, url, "POST", payload);
+  const response = await performStatuspageRequest(env, url, "POST", payload);
   if (!response.ok) {
     return response;
   }
 
-  const incidentId = extractInstatusIncidentId(response.body);
+  const incidentId = extractStatuspageIncidentId(response.body);
   if (!incidentId) {
     return {
       ok: false,
-      message: "Instatus a raspuns fara ID de incident.",
+      message: "Statuspage a raspuns fara ID de incident.",
     };
   }
 
@@ -2096,38 +2157,27 @@ async function createInstatusIncident(env, sourceIncident) {
   };
 }
 
-async function updateExistingInstatusIncident(env, existingState, sourceIncident) {
-  const apiBase = (env.INSTATUS_API_BASE_URL || "https://api.instatus.com").replace(/\/+$/, "");
-  const pageId = String(env.INSTATUS_PAGE_ID || "").trim();
-  const incidentId = existingState.instatusIncidentId;
-  const incidentUrl = `${apiBase}/v1/${encodeURIComponent(pageId)}/incidents/${encodeURIComponent(incidentId)}`;
-  const updateUrl = `${incidentUrl}/incident-updates`;
+async function updateExistingStatuspageIncident(env, existingState, sourceIncident) {
+  const config = getStatuspageConfig(env);
+  const incidentId = getStoredIncidentId(existingState);
+  const incidentUrl = `${config.apiBaseUrl}/v1/pages/${encodeURIComponent(config.pageId)}/incidents/${encodeURIComponent(incidentId)}`;
+  const payload = {
+    incident: applyAffectedComponents(
+      {
+        name: sourceIncident.publicIncident.title,
+        body: sourceIncident.publicIncident.description,
+        status: sourceIncident.status.statuspage,
+        deliver_notifications: config.deliverNotifications,
+      },
+      env,
+      sourceIncident.status,
+      sourceIncident.source,
+    ),
+  };
 
-  const startedAt = parseDateToIso(sourceIncident.rawPubDate);
-  const updateIncidentPayload = applyAffectedComponents({
-    name: sourceIncident.publicIncident.title,
-    status: sourceIncident.status.instatus,
-    notify: readBoolean(env.INSTATUS_NOTIFY, false),
-  }, env, sourceIncident.status, sourceIncident.source);
-
-  if (startedAt) {
-    updateIncidentPayload.started = startedAt;
-  }
-
-  const incidentResponse = await performInstatusRequest(env, incidentUrl, "PUT", updateIncidentPayload);
-  if (!incidentResponse.ok) {
-    return incidentResponse;
-  }
-
-  const incidentUpdatePayload = applyAffectedComponents({
-    message: sourceIncident.publicIncident.description,
-    status: sourceIncident.status.instatus,
-    notify: readBoolean(env.INSTATUS_NOTIFY, false),
-  }, env, sourceIncident.status, sourceIncident.source);
-
-  const updateResponse = await performInstatusRequest(env, updateUrl, "POST", incidentUpdatePayload);
-  if (!updateResponse.ok) {
-    return updateResponse;
+  const response = await performStatuspageRequest(env, incidentUrl, "PATCH", payload);
+  if (!response.ok) {
+    return response;
   }
 
   return {
@@ -2136,12 +2186,28 @@ async function updateExistingInstatusIncident(env, existingState, sourceIncident
   };
 }
 
-async function performInstatusRequest(env, url, method, payload) {
+function isStatuspageRateLimitedStatus(statusCode) {
+  return statusCode === 420 || statusCode === 429;
+}
+
+async function waitForStatuspageRateLimitWindow() {
+  const minimumGapMs = 1100;
+  const elapsed = Date.now() - lastStatuspageRequestAt;
+  const waitMs = minimumGapMs - elapsed;
+  if (waitMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+  lastStatuspageRequestAt = Date.now();
+}
+
+async function performStatuspageRequest(env, url, method, payload) {
   try {
+    const config = getStatuspageConfig(env);
+    await waitForStatuspageRateLimitWindow();
     const response = await fetch(url, {
       method,
       headers: {
-        Authorization: `Bearer ${env.INSTATUS_API_KEY}`,
+        Authorization: `OAuth ${config.apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
@@ -2154,9 +2220,9 @@ async function performInstatusRequest(env, url, method, payload) {
         statusCode: response.status,
         retryAfterSeconds: getRetryAfterSeconds(response),
         message:
-          response.status === 429
-            ? "Trimiterea catre Instatus a fost limitata temporar cu codul 429."
-            : `Trimiterea catre Instatus a esuat cu codul ${response.status}.`,
+          isStatuspageRateLimitedStatus(response.status)
+            ? `Trimiterea catre Statuspage a fost limitata temporar cu codul ${response.status}.`
+            : `Trimiterea catre Statuspage a esuat cu codul ${response.status}.`,
         body,
       };
     }
@@ -2166,10 +2232,10 @@ async function performInstatusRequest(env, url, method, payload) {
       body,
     };
   } catch (error) {
-    console.error("Eroare Instatus:", sanitizeError(error));
+    console.error("Eroare Statuspage:", sanitizeError(error));
     return {
       ok: false,
-      message: "Trimiterea catre Instatus a esuat.",
+      message: "Trimiterea catre Statuspage a esuat.",
     };
   }
 }
@@ -2186,7 +2252,7 @@ async function parseResponseBody(response) {
   }
 }
 
-function extractInstatusIncidentId(body) {
+function extractStatuspageIncidentId(body) {
   if (!body) {
     return "";
   }
