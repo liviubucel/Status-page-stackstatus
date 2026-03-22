@@ -1011,14 +1011,21 @@ async function syncPendingFeedEntries(env, source, entries) {
   for (const entry of entries) {
     const sourceIncident = await buildSourceIncident(entry, env, source);
     latestPublicIncident = sourceIncident.publicIncident;
+    const existingState = await readIncidentState(env, source, sourceIncident.sourceKey);
+    const normalizedTitle = normalizeWhitespace(sourceIncident.rawTitle || "").toLowerCase();
+
+    if (!sourceIncident.status.statuspage && is20iRssSource(source) && isGenericRssUpdateTitle(normalizedTitle)) {
+      const inheritedStatus = getStatusRuleByStatuspageValue(existingState?.currentStatus);
+      if (inheritedStatus) {
+        sourceIncident.status = inheritedStatus;
+      }
+    }
 
     if (!sourceIncident.status.statuspage) {
       await writeFeedCursor(env, source, sourceIncident);
       skippedCount += 1;
       continue;
     }
-
-    const existingState = await readIncidentState(env, source, sourceIncident.sourceKey);
     const action = determineStatuspageAction(existingState, sourceIncident);
 
     if (action === "skip") {
@@ -1062,7 +1069,7 @@ async function syncPendingFeedEntries(env, source, entries) {
 }
 
 async function buildSourceIncident(entry, env, source) {
-  const status = mapStatus(entry.title, entry.description);
+  const status = mapSourceStatus(entry, source);
   const publicIncident = await buildPublicIncident(entry, env, source, status);
 
   return {
@@ -1076,6 +1083,52 @@ async function buildSourceIncident(entry, env, source) {
     sourceKey: normalizeWhitespace(entry.sourceKey || "") || buildSourceIncidentKey(entry.title, status),
     publicIncident,
   };
+}
+
+function mapSourceStatus(entry, source) {
+  const mapped = mapStatus(entry?.title, entry?.description);
+  if (mapped?.statuspage) {
+    return mapped;
+  }
+
+  if (is20iRssSource(source)) {
+    return inferRssStatus(entry?.title);
+  }
+
+  return mapped;
+}
+
+function inferRssStatus(title) {
+  const normalized = normalizeWhitespace(title || "").toLowerCase();
+  if (!normalized) {
+    return getStatusRule("investigating");
+  }
+
+  if (isGenericRssUpdateTitle(normalized)) {
+    return {
+      key: "necunoscut",
+      translated: "Actualizare incident",
+      statuspage: null,
+    };
+  }
+
+  if (/\bresolved\b/.test(normalized)) {
+    return getStatusRule("resolved");
+  }
+
+  // 20i exposes an incident-only RSS feed, so a plain new title means an active incident.
+  return getStatusRule("investigating");
+}
+
+function isGenericRssUpdateTitle(title) {
+  const normalized = normalizeWhitespace(title || "").toLowerCase();
+  return /(?:^|[\s\-:|])update\s*$/.test(normalized) && !/\b(resolved|monitoring|identified|investigating)\b/.test(normalized);
+}
+
+function is20iRssSource(source) {
+  const sourceId = normalizeWhitespace(source?.id || "").toLowerCase();
+  const rssUrl = normalizeWhitespace(source?.rssUrl || "").toLowerCase();
+  return sourceId === "20i" || rssUrl.includes("stackstatus.com");
 }
 
 async function buildPublicIncident(entry, env, source, statusHint = null) {
@@ -1441,6 +1494,11 @@ function inferOneUptimeStatus(title, description, isActiveIncident = false) {
 
 function getStatusRule(key) {
   return STATUS_RULES.find((rule) => rule.key === key) || null;
+}
+
+function getStatusRuleByStatuspageValue(status) {
+  const normalized = normalizeIncidentStatusValue(status);
+  return STATUS_RULES.find((rule) => rule.statuspage === normalized) || null;
 }
 
 function parseDiagnosticStatus(value) {
