@@ -5,6 +5,7 @@ Worker Cloudflare care:
 - preia incidente din surse externe de status
 - parseaza RSS/Atom fara librarii externe
 - traduce continutul in romana cu Workers AI
+- clasifica impactul din textul original cu Workers AI
 - detecteaza doar intrarile noi cu KV, separat pe sursa
 - creeaza si actualizeaza incidente in Atlassian Statuspage
 - poate marca automat incidentele ca rezolvate daca sursa nu mai raporteaza probleme active
@@ -39,9 +40,10 @@ Le gasesti in interfata de management Statuspage, la `API info`.
 2. Poate monitoriza optional si o a doua sursa OneUptime, de exemplu Upmind.
 3. Normalizeaza toate sursele intr-un format comun.
 4. Traduce titlul si descrierea in romana.
-5. Tine stare in KV pentru fiecare sursa, ca sa nu dubleze incidentele.
-6. Leaga update-urile `investigating / identified / monitoring / resolved` de acelasi incident Statuspage.
-7. Poate colora automat componentele din Statuspage daca setezi `component_ids`.
+5. Clasifica impactul textului in `major_outage / partial_outage / degraded_performance / operational`.
+6. Tine stare in KV pentru fiecare sursa, ca sa nu dubleze incidentele.
+7. Leaga update-urile `investigating / identified / monitoring / resolved` de acelasi incident Statuspage.
+8. Poate colora automat componentele din Statuspage daca setezi `component_ids`.
 
 ## Deploy si configurare
 
@@ -136,6 +138,9 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `AI_SOURCE_LANG`
 - `AI_TARGET_LANG`
 - `AI_MAX_INPUT_LENGTH`
+- `AI_INCIDENT_CLASSIFICATION_ENABLED`
+- `AI_INCIDENT_CLASSIFICATION_MODEL`
+- `AI_INCIDENT_CLASSIFICATION_MAX_INPUT_LENGTH`
 - `MANUAL_SYNC_TOKEN`
 
 ### 6. Cron
@@ -235,6 +240,9 @@ https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU&diagnostic=1&status=
 - `AI_SOURCE_LANG` - optional
 - `AI_TARGET_LANG` - optional
 - `AI_MAX_INPUT_LENGTH` - optional
+- `AI_INCIDENT_CLASSIFICATION_ENABLED` - optional, implicit `true`
+- `AI_INCIDENT_CLASSIFICATION_MODEL` - optional
+- `AI_INCIDENT_CLASSIFICATION_MAX_INPUT_LENGTH` - optional
 - `MANUAL_SYNC_TOKEN` - optional, recomandat ca secret
 
 ## Componente in Statuspage
@@ -252,6 +260,8 @@ Maparea implicita este:
 - `identified` -> `partial_outage`
 - `monitoring` -> `degraded_performance`
 - `resolved` -> `operational`
+
+Daca AI sau regulile gasesc un impact explicit in text, componentele si `impact_override` din Statuspage folosesc acel impact in locul maparii implicite de mai sus.
 
 Poti suprascrie cu:
 

@@ -8,6 +8,9 @@ const DEFAULT_AI_TRANSLATION_ENABLED = true;
 const DEFAULT_AI_SOURCE_LANG = "english";
 const DEFAULT_AI_TARGET_LANG = "romanian";
 const DEFAULT_AI_MAX_INPUT_LENGTH = 3500;
+const DEFAULT_AI_INCIDENT_CLASSIFICATION_ENABLED = true;
+const DEFAULT_AI_INCIDENT_CLASSIFICATION_MODEL = "@cf/meta/llama-3.1-8b-instruct-awq";
+const DEFAULT_AI_INCIDENT_CLASSIFICATION_MAX_INPUT_LENGTH = 2200;
 const DEFAULT_STATUSPAGE_RETRY_AFTER_SECONDS = 300;
 const DEFAULT_STATUSPAGE_API_BASE_URL = "https://api.statuspage.io";
 const DEFAULT_HIDE_SOURCE_LINKS = true;
@@ -43,6 +46,83 @@ const STATUS_RULES = [
     keywords: ["resolved"],
     translated: "Rezolvat",
     statuspage: "resolved",
+  },
+];
+
+const IMPACT_RULES = [
+  {
+    key: "major_outage",
+    keywords: [
+      "major outage",
+      "service unavailable",
+      "site unavailable",
+      "full outage",
+      "down",
+      "offline",
+      "unavailable",
+      "cannot access",
+      "can't access",
+      "failed",
+      "failure",
+      "outage",
+      "critical",
+    ],
+    impactOverride: "critical",
+    componentStatus: "major_outage",
+  },
+  {
+    key: "partial_outage",
+    keywords: [
+      "partial outage",
+      "partial disruption",
+      "partial service disruption",
+      "some users",
+      "subset of users",
+      "certain users",
+      "limited availability",
+      "reduced availability",
+      "experiencing issues",
+    ],
+    impactOverride: "major",
+    componentStatus: "partial_outage",
+  },
+  {
+    key: "degraded_performance",
+    keywords: [
+      "degraded performance",
+      "degraded",
+      "latency",
+      "high latency",
+      "increased latency",
+      "intermittent",
+      "slow",
+      "slowness",
+      "warning",
+      "connectivity issues",
+      "error rates",
+      "maintenance",
+      "scheduled maintenance",
+      "under maintenance",
+      "maintenance window",
+      "flapping",
+    ],
+    impactOverride: "minor",
+    componentStatus: "degraded_performance",
+  },
+  {
+    key: "operational",
+    keywords: [
+      "resolved",
+      "restored",
+      "stable",
+      "operational",
+      "completed",
+      "maintenance completed",
+      "issue resolved",
+      "all systems operational",
+    ],
+    impactOverride: "none",
+    componentStatus: "operational",
   },
 ];
 
@@ -1021,6 +1101,13 @@ async function syncPendingFeedEntries(env, source, entries) {
       }
     }
 
+    if (!hasKnownImpact(sourceIncident.impact)) {
+      const inheritedImpact = getStoredImpact(existingState);
+      if (hasKnownImpact(inheritedImpact)) {
+        sourceIncident.impact = inheritedImpact;
+      }
+    }
+
     if (!sourceIncident.status.statuspage) {
       await writeFeedCursor(env, source, sourceIncident);
       skippedCount += 1;
@@ -1070,6 +1157,8 @@ async function syncPendingFeedEntries(env, source, entries) {
 
 async function buildSourceIncident(entry, env, source) {
   const status = mapSourceStatus(entry, source);
+  const sourceKey = buildEntrySourceKey(entry, source, status);
+  const impact = await classifyIncidentImpact(entry, env, source, status);
   const publicIncident = await buildPublicIncident(entry, env, source, status);
 
   return {
@@ -1080,7 +1169,8 @@ async function buildSourceIncident(entry, env, source) {
     rawPubDate: entry.pubDate || "",
     rawLink: entry.link || "",
     status,
-    sourceKey: normalizeWhitespace(entry.sourceKey || "") || buildSourceIncidentKey(entry.title, status),
+    sourceKey,
+    impact,
     publicIncident,
   };
 }
@@ -1129,6 +1219,26 @@ function is20iRssSource(source) {
   const sourceId = normalizeWhitespace(source?.id || "").toLowerCase();
   const rssUrl = normalizeWhitespace(source?.rssUrl || "").toLowerCase();
   return sourceId === "20i" || rssUrl.includes("stackstatus.com");
+}
+
+function buildEntrySourceKey(entry, source, statusHint) {
+  const explicit = normalizeWhitespace(entry?.sourceKey || "");
+  if (explicit) {
+    return explicit;
+  }
+
+  const rawTitle = is20iRssSource(source)
+    ? normalize20iIncidentKeyTitle(entry?.title)
+    : normalizeWhitespace(entry?.title || "");
+
+  return buildSourceIncidentKey(rawTitle, statusHint);
+}
+
+function normalize20iIncidentKeyTitle(title) {
+  return normalizeWhitespace(title || "")
+    .replace(/^\s*(?:resolved|update)\s*[-:|]\s*/i, "")
+    .replace(/\s*[-:|]\s*(?:resolved|update)\s*$/i, "")
+    .trim();
 }
 
 async function buildPublicIncident(entry, env, source, statusHint = null) {
@@ -1291,6 +1401,8 @@ async function writeIncidentState(env, source, sourceIncident, statuspageInciden
     return;
   }
 
+  const impactConfidence = Number.parseFloat(sourceIncident?.impact?.confidence);
+
   const payload = {
     sourceId: source.id,
     sourceName: source.name,
@@ -1300,6 +1412,12 @@ async function writeIncidentState(env, source, sourceIncident, statuspageInciden
     lastFeedEntryId: sourceIncident.entryId,
     lastFeedEntryDate: sourceIncident.rawPubDate || "",
     lastTitle: sourceIncident.rawTitle || "",
+    currentImpactKey: normalizeImpactKey(sourceIncident?.impact?.key || ""),
+    currentImpactOverride: normalizeWhitespace(sourceIncident?.impact?.impactOverride || ""),
+    currentComponentStatus: normalizeWhitespace(sourceIncident?.impact?.componentStatus || ""),
+    impactMethod: normalizeWhitespace(sourceIncident?.impact?.method || ""),
+    impactReason: normalizeWhitespace(sourceIncident?.impact?.reason || ""),
+    impactConfidence: Number.isFinite(impactConfidence) ? Number(impactConfidence.toFixed(3)) : null,
     updatedAt: new Date().toISOString(),
   };
 
@@ -1435,6 +1553,114 @@ function buildResolvedBaseTitle(lastTitle, sourceKey) {
   const derived = buildSourceIncidentKey(lastTitle, status);
   const base = normalizeWhitespace(derived || sourceKey || lastTitle || "Incident");
   return capitalizeRomanianText(base);
+}
+
+function getImpactRule(key) {
+  const normalized = normalizeImpactKey(key);
+  return IMPACT_RULES.find((rule) => rule.key === normalized) || null;
+}
+
+function normalizeImpactKey(value) {
+  const normalized = normalizeWhitespace(String(value || "")).toLowerCase().replace(/[\s-]+/g, "_");
+  if (!normalized) {
+    return "";
+  }
+
+  const aliasMap = {
+    major: "major_outage",
+    critical: "major_outage",
+    major_outage: "major_outage",
+    partial: "partial_outage",
+    partial_outage: "partial_outage",
+    degraded: "degraded_performance",
+    minor: "degraded_performance",
+    degraded_performance: "degraded_performance",
+    maintenance: "degraded_performance",
+    operational: "operational",
+    none: "operational",
+    resolved: "operational",
+    unknown: "unknown",
+  };
+
+  return aliasMap[normalized] || "";
+}
+
+function buildUnknownImpact(extra = {}) {
+  return {
+    key: "unknown",
+    impactOverride: "",
+    componentStatus: "",
+    ...extra,
+  };
+}
+
+function hasKnownImpact(impact) {
+  return Boolean(getImpactRule(impact?.key));
+}
+
+function getStoredImpact(existingState) {
+  const storedRule = getImpactRule(existingState?.currentImpactKey);
+  if (!storedRule) {
+    return buildUnknownImpact();
+  }
+
+  const confidence = Number.parseFloat(existingState?.impactConfidence);
+  return {
+    ...storedRule,
+    method: normalizeWhitespace(existingState?.impactMethod || "") || "stored",
+    reason: normalizeWhitespace(existingState?.impactReason || ""),
+    confidence: Number.isFinite(confidence) ? confidence : undefined,
+  };
+}
+
+function classifyImpactWithRules(title, description, statusHint) {
+  if (normalizeIncidentStatusValue(statusHint?.statuspage) === "resolved") {
+    return {
+      ...getImpactRule("operational"),
+      method: "status",
+      reason: "Statusul incidentului este resolved.",
+    };
+  }
+
+  const normalized = `${normalizeWhitespace(title || "")} ${prepareTextForTranslation(description, {
+    stripHtml: true,
+    fallback: "",
+  })}`
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  let bestMatch = null;
+
+  for (const rule of IMPACT_RULES) {
+    for (const keyword of rule.keywords) {
+      const index = normalized.indexOf(keyword);
+      if (index === -1) {
+        continue;
+      }
+
+      const score = keyword.length;
+      if (
+        !bestMatch ||
+        score > bestMatch.score ||
+        (score === bestMatch.score && index < bestMatch.index)
+      ) {
+        bestMatch = { rule, keyword, index, score };
+      }
+    }
+  }
+
+  if (!bestMatch) {
+    return null;
+  }
+
+  return {
+    ...bestMatch.rule,
+    method: "rules",
+    reason: `Potrivire text: ${bestMatch.keyword}.`,
+  };
 }
 
 function formatStatusPrefixedTitle(status, titleBase) {
@@ -1677,7 +1903,11 @@ function getConfiguredComponentIds(source) {
     .filter(Boolean);
 }
 
-function mapIncidentToComponentStatus(incidentStatus, env) {
+function mapIncidentToComponentStatus(incidentStatus, env, incidentImpact = null) {
+  if (hasKnownImpact(incidentImpact) && incidentImpact.componentStatus) {
+    return incidentImpact.componentStatus;
+  }
+
   const defaults = {
     investigating: "major_outage",
     identified: "partial_outage",
@@ -1707,17 +1937,17 @@ function mapIncidentToComponentStatus(incidentStatus, env) {
   );
 }
 
-function applyAffectedComponents(payload, env, incidentStatus, source) {
-  if (!source?.componentStatusUpdatesEnabled) {
+function applyAffectedComponents(payload, env, sourceIncident) {
+  if (!sourceIncident?.source?.componentStatusUpdatesEnabled) {
     return payload;
   }
 
-  const componentIds = getConfiguredComponentIds(source);
+  const componentIds = getConfiguredComponentIds(sourceIncident.source);
   if (!componentIds.length) {
     return payload;
   }
 
-  const componentStatus = mapIncidentToComponentStatus(incidentStatus, env);
+  const componentStatus = mapIncidentToComponentStatus(sourceIncident.status, env, sourceIncident.impact);
   payload.component_ids = componentIds;
   payload.components = Object.fromEntries(componentIds.map((componentId) => [componentId, componentStatus]));
   return payload;
@@ -2040,6 +2270,133 @@ function getAiMaxInputLength(env) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AI_MAX_INPUT_LENGTH;
 }
 
+function shouldUseAiIncidentClassification(env) {
+  return Boolean(
+    env?.AI &&
+      typeof env.AI.run === "function" &&
+      readBoolean(env.AI_INCIDENT_CLASSIFICATION_ENABLED, DEFAULT_AI_INCIDENT_CLASSIFICATION_ENABLED),
+  );
+}
+
+function getAiIncidentClassificationModel(env) {
+  return env?.AI_INCIDENT_CLASSIFICATION_MODEL || DEFAULT_AI_INCIDENT_CLASSIFICATION_MODEL;
+}
+
+function getAiIncidentClassificationMaxInputLength(env) {
+  const parsed = Number.parseInt(env?.AI_INCIDENT_CLASSIFICATION_MAX_INPUT_LENGTH, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AI_INCIDENT_CLASSIFICATION_MAX_INPUT_LENGTH;
+}
+
+function buildIncidentClassificationPrompt(entry, source, statusHint, env) {
+  const title = prepareTextForTranslation(entry?.title, {
+    stripHtml: true,
+    maxLength: 300,
+    fallback: "",
+  });
+  const description = prepareTextForTranslation(entry?.description, {
+    stripHtml: true,
+    maxLength: getAiIncidentClassificationMaxInputLength(env),
+    fallback: "",
+  });
+  const payload = [
+    `Source: ${normalizeWhitespace(source?.name || "unknown") || "unknown"}`,
+    `Lifecycle status hint: ${normalizeIncidentStatusValue(statusHint?.statuspage || "unknown") || "unknown"}`,
+    `Title: ${title || "(empty)"}`,
+    `Description: ${description || "(empty)"}`,
+  ].join("\n");
+
+  return limitLength(payload, getAiIncidentClassificationMaxInputLength(env));
+}
+
+function extractAiJsonObject(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fencedMatch?.[1] || raw;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAiImpactClassification(aiPayload) {
+  const impactKey = normalizeImpactKey(
+    aiPayload?.impact ||
+    aiPayload?.classification ||
+    aiPayload?.severity ||
+    aiPayload?.category ||
+    "",
+  );
+
+  if (!impactKey) {
+    return null;
+  }
+
+  if (impactKey === "unknown") {
+    return buildUnknownImpact({
+      method: "ai",
+      reason: normalizeWhitespace(aiPayload?.reason || aiPayload?.explanation || ""),
+    });
+  }
+
+  const rule = getImpactRule(impactKey);
+  if (!rule) {
+    return null;
+  }
+
+  const confidence = Number.parseFloat(aiPayload?.confidence);
+  return {
+    ...rule,
+    method: "ai",
+    reason: normalizeWhitespace(aiPayload?.reason || aiPayload?.explanation || ""),
+    confidence: Number.isFinite(confidence) ? confidence : undefined,
+  };
+}
+
+async function classifyIncidentImpact(entry, env, source, statusHint) {
+  if (shouldUseAiIncidentClassification(env)) {
+    try {
+      const messages = [
+        {
+          role: "system",
+          content:
+            "You classify incident impact from source text only. Return strict minified JSON with keys impact, confidence, reason. impact must be exactly one of: major_outage, partial_outage, degraded_performance, operational, unknown. Use only the provided text. If the text is ambiguous, return unknown. Scheduled or planned maintenance without total unavailability maps to degraded_performance. Resolved, restored, completed, or operational maps to operational.",
+        },
+        {
+          role: "user",
+          content: buildIncidentClassificationPrompt(entry, source, statusHint, env),
+        },
+      ];
+      const aiResponse = await env.AI.run(getAiIncidentClassificationModel(env), { messages });
+      const aiText = extractAiTranslatedText(aiResponse);
+      const aiPayload = extractAiJsonObject(aiText);
+      const normalized = normalizeAiImpactClassification(aiPayload);
+      if (hasKnownImpact(normalized)) {
+        return normalized;
+      }
+    } catch (error) {
+      console.error("Eroare clasificare AI impact:", sanitizeError(error));
+    }
+  }
+
+  const rulesImpact = classifyImpactWithRules(entry?.title, entry?.description, statusHint);
+  if (rulesImpact) {
+    return rulesImpact;
+  }
+
+  return buildUnknownImpact();
+}
+
 function extractAiTranslatedText(aiResponse) {
   if (!aiResponse) {
     return "";
@@ -2187,19 +2544,7 @@ function normalizeTranslatedStatusPhrases(text, statusHint) {
 async function createStatuspageIncident(env, sourceIncident) {
   const config = getStatuspageConfig(env);
   const url = `${config.apiBaseUrl}/v1/pages/${encodeURIComponent(config.pageId)}/incidents`;
-  const payload = {
-    incident: applyAffectedComponents(
-      {
-        name: sourceIncident.publicIncident.title,
-        body: sourceIncident.publicIncident.description,
-        status: sourceIncident.status.statuspage,
-        deliver_notifications: config.deliverNotifications,
-      },
-      env,
-      sourceIncident.status,
-      sourceIncident.source,
-    ),
-  };
+  const payload = buildStatuspageIncidentPayload(env, config, sourceIncident);
 
   const response = await performStatuspageRequest(env, url, "POST", payload);
   if (!response.ok) {
@@ -2224,19 +2569,7 @@ async function updateExistingStatuspageIncident(env, existingState, sourceIncide
   const config = getStatuspageConfig(env);
   const incidentId = getStoredIncidentId(existingState);
   const incidentUrl = `${config.apiBaseUrl}/v1/pages/${encodeURIComponent(config.pageId)}/incidents/${encodeURIComponent(incidentId)}`;
-  const payload = {
-    incident: applyAffectedComponents(
-      {
-        name: sourceIncident.publicIncident.title,
-        body: sourceIncident.publicIncident.description,
-        status: sourceIncident.status.statuspage,
-        deliver_notifications: config.deliverNotifications,
-      },
-      env,
-      sourceIncident.status,
-      sourceIncident.source,
-    ),
-  };
+  const payload = buildStatuspageIncidentPayload(env, config, sourceIncident);
 
   const response = await performStatuspageRequest(env, incidentUrl, "PATCH", payload);
   if (!response.ok) {
@@ -2247,6 +2580,25 @@ async function updateExistingStatuspageIncident(env, existingState, sourceIncide
     ok: true,
     incidentId,
   };
+}
+
+function buildStatuspageIncidentPayload(env, config, sourceIncident) {
+  const incident = applyAffectedComponents(
+    {
+      name: sourceIncident.publicIncident.title,
+      body: sourceIncident.publicIncident.description,
+      status: sourceIncident.status.statuspage,
+      deliver_notifications: config.deliverNotifications,
+    },
+    env,
+    sourceIncident,
+  );
+
+  if (hasKnownImpact(sourceIncident?.impact) && sourceIncident.impact.impactOverride) {
+    incident.impact_override = sourceIncident.impact.impactOverride;
+  }
+
+  return { incident };
 }
 
 function isStatuspageRateLimitedStatus(statusCode) {
