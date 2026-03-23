@@ -24,6 +24,41 @@ let lastStatuspageRequestAt = 0;
 
 const STATUS_RULES = [
   {
+    key: "completed",
+    keywords: [
+      "scheduled maintenance completed",
+      "maintenance completed",
+      "completed maintenance",
+      "maintenance complete",
+    ],
+    translated: "Mentenanta finalizata",
+    statuspage: "completed",
+  },
+  {
+    key: "in_progress",
+    keywords: [
+      "maintenance in progress",
+      "scheduled maintenance in progress",
+      "under maintenance",
+      "maintenance underway",
+      "maintenance ongoing",
+      "in progress maintenance",
+    ],
+    translated: "Mentenanta in curs",
+    statuspage: "in_progress",
+  },
+  {
+    key: "scheduled",
+    keywords: [
+      "planned maintenance",
+      "scheduled maintenance",
+      "maintenance scheduled",
+      "maintenance window",
+    ],
+    translated: "Mentenanta programata",
+    statuspage: "scheduled",
+  },
+  {
     key: "investigating",
     keywords: ["investigating"],
     translated: "Investigam",
@@ -127,6 +162,11 @@ const IMPACT_RULES = [
 ];
 
 const PHRASE_TRANSLATIONS = [
+  ["scheduled maintenance completed", "mentenanta programata a fost finalizata"],
+  ["maintenance completed", "mentenanta a fost finalizata"],
+  ["maintenance in progress", "mentenanta este in curs"],
+  ["scheduled maintenance", "mentenanta programata"],
+  ["planned maintenance", "mentenanta programata"],
   ["we are actively investigating", "investigam activ"],
   ["we are investigating reports of", "investigam rapoartele privind"],
   ["we are investigating", "investigam"],
@@ -170,6 +210,9 @@ const PHRASE_TRANSLATIONS = [
   ["api issues", "probleme API"],
   ["read-only mode", "mod doar citire"],
   ["under maintenance", "in mentenanta"],
+  ["in progress", "in curs"],
+  ["scheduled", "programat"],
+  ["completed", "finalizat"],
   ["investigating", "investigam"],
   ["identified", "identificat"],
   ["monitoring", "monitorizam"],
@@ -200,6 +243,9 @@ const WORD_TRANSLATIONS = {
   major: "majora",
   monitoring: "monitorizare",
   maintenance: "mentenanta",
+  scheduled: "programata",
+  planned: "planificata",
+  completed: "finalizata",
   update: "actualizare",
   updates: "actualizari",
   restore: "restabilire",
@@ -654,9 +700,17 @@ async function fetchSourceEntries(source, env) {
       };
     }
 
+    let incidents = parseRSS(rssResult.xml);
+    if (is20iRssSource(source)) {
+      const pageResult = await fetchStackStatusPage(env, source);
+      if (pageResult.ok) {
+        incidents = mergeSourceEntries(incidents, parseStackStatusPage(pageResult.html));
+      }
+    }
+
     return {
       ok: true,
-      incidents: parseRSS(rssResult.xml),
+      incidents,
     };
   }
 
@@ -1101,6 +1155,12 @@ async function syncPendingFeedEntries(env, source, entries) {
       }
     }
 
+    sourceIncident.maintenance = mergeMaintenanceState(sourceIncident.maintenance, getStoredMaintenance(existingState));
+    if (hasMaintenanceLifecycle(sourceIncident.maintenance)) {
+      sourceIncident.status =
+        getStatusRuleByStatuspageValue(sourceIncident.maintenance.statuspageStatus) || sourceIncident.status;
+    }
+
     if (!hasKnownImpact(sourceIncident.impact)) {
       const inheritedImpact = getStoredImpact(existingState);
       if (hasKnownImpact(inheritedImpact)) {
@@ -1141,7 +1201,7 @@ async function syncPendingFeedEntries(env, source, entries) {
 
     if (action === "create") {
       createdCount += 1;
-    } else if (sourceIncident.status.statuspage === "resolved") {
+    } else if (isResolvedIncidentStatus(sourceIncident.maintenance?.statuspageStatus || sourceIncident.status.statuspage)) {
       resolvedCount += 1;
     } else {
       updatedCount += 1;
@@ -1156,9 +1216,10 @@ async function syncPendingFeedEntries(env, source, entries) {
 }
 
 async function buildSourceIncident(entry, env, source) {
-  const status = mapSourceStatus(entry, source);
-  const sourceKey = buildEntrySourceKey(entry, source, status);
-  const impact = await classifyIncidentImpact(entry, env, source, status);
+  const initialStatus = mapSourceStatus(entry, source);
+  const sourceKey = buildEntrySourceKey(entry, source, initialStatus);
+  const semantics = await classifyIncidentSemantics(entry, env, source, initialStatus);
+  const status = semantics.status || initialStatus;
   const publicIncident = await buildPublicIncident(entry, env, source, status);
 
   return {
@@ -1170,7 +1231,8 @@ async function buildSourceIncident(entry, env, source) {
     rawLink: entry.link || "",
     status,
     sourceKey,
-    impact,
+    impact: semantics.impact,
+    maintenance: semantics.maintenance,
     publicIncident,
   };
 }
@@ -1277,7 +1339,7 @@ function normalizeIncidentStatusValue(status) {
 }
 
 function isResolvedIncidentStatus(status) {
-  return normalizeIncidentStatusValue(status) === "resolved";
+  return ["resolved", "completed"].includes(normalizeIncidentStatusValue(status));
 }
 
 function determineStatuspageAction(existingState, sourceIncident) {
@@ -1402,13 +1464,19 @@ async function writeIncidentState(env, source, sourceIncident, statuspageInciden
   }
 
   const impactConfidence = Number.parseFloat(sourceIncident?.impact?.confidence);
+  const storedMaintenance = sourceIncident?.publishedMaintenance || sourceIncident?.maintenance;
+  const effectiveStatus =
+    normalizeMaintenanceStatus(storedMaintenance?.statuspageStatus) ||
+    normalizeIncidentStatusValue(sourceIncident?.publishedStatus || "") ||
+    sourceIncident?.status?.statuspage ||
+    "";
 
   const payload = {
     sourceId: source.id,
     sourceName: source.name,
     sourceKey: sourceIncident.sourceKey,
     statuspageIncidentId,
-    currentStatus: sourceIncident.status.statuspage,
+    currentStatus: effectiveStatus,
     lastFeedEntryId: sourceIncident.entryId,
     lastFeedEntryDate: sourceIncident.rawPubDate || "",
     lastTitle: sourceIncident.rawTitle || "",
@@ -1418,6 +1486,12 @@ async function writeIncidentState(env, source, sourceIncident, statuspageInciden
     impactMethod: normalizeWhitespace(sourceIncident?.impact?.method || ""),
     impactReason: normalizeWhitespace(sourceIncident?.impact?.reason || ""),
     impactConfidence: Number.isFinite(impactConfidence) ? Number(impactConfidence.toFixed(3)) : null,
+    isMaintenance: Boolean(storedMaintenance?.isMaintenance),
+    maintenanceStatus: normalizeMaintenanceStatus(storedMaintenance?.statuspageStatus || ""),
+    scheduledFor: normalizeIsoDateTime(storedMaintenance?.scheduledFor || ""),
+    scheduledUntil: normalizeIsoDateTime(storedMaintenance?.scheduledUntil || ""),
+    maintenanceMethod: normalizeWhitespace(storedMaintenance?.method || ""),
+    maintenanceReason: normalizeWhitespace(storedMaintenance?.reason || ""),
     updatedAt: new Date().toISOString(),
   };
 
@@ -1598,6 +1672,75 @@ function hasKnownImpact(impact) {
   return Boolean(getImpactRule(impact?.key));
 }
 
+function buildUnknownMaintenance(extra = {}) {
+  return {
+    isMaintenance: false,
+    statuspageStatus: "",
+    scheduledFor: "",
+    scheduledUntil: "",
+    ...extra,
+  };
+}
+
+function normalizeMaintenanceStatus(value) {
+  const normalized = normalizeWhitespace(String(value || "")).toLowerCase().replace(/[\s-]+/g, "_");
+  const aliasMap = {
+    scheduled: "scheduled",
+    planned: "scheduled",
+    planned_maintenance: "scheduled",
+    scheduled_maintenance: "scheduled",
+    in_progress: "in_progress",
+    inprogress: "in_progress",
+    underway: "in_progress",
+    under_maintenance: "in_progress",
+    completed: "completed",
+    complete: "completed",
+    finished: "completed",
+    resolved: "completed",
+  };
+
+  return aliasMap[normalized] || "";
+}
+
+function hasMaintenanceLifecycle(maintenance) {
+  return Boolean(maintenance?.isMaintenance && normalizeMaintenanceStatus(maintenance?.statuspageStatus));
+}
+
+function getStoredMaintenance(existingState) {
+  const statuspageStatus = normalizeMaintenanceStatus(existingState?.maintenanceStatus || existingState?.currentStatus || "");
+  if (!readBoolean(existingState?.isMaintenance, false) && !["scheduled", "in_progress", "completed"].includes(statuspageStatus)) {
+    return buildUnknownMaintenance();
+  }
+
+  return {
+    isMaintenance: true,
+    statuspageStatus,
+    scheduledFor: normalizeIsoDateTime(existingState?.scheduledFor),
+    scheduledUntil: normalizeIsoDateTime(existingState?.scheduledUntil),
+    method: normalizeWhitespace(existingState?.maintenanceMethod || "") || "stored",
+    reason: normalizeWhitespace(existingState?.maintenanceReason || ""),
+  };
+}
+
+function mergeMaintenanceState(currentMaintenance, fallbackMaintenance) {
+  if (!hasMaintenanceLifecycle(currentMaintenance) && !hasMaintenanceLifecycle(fallbackMaintenance)) {
+    return buildUnknownMaintenance();
+  }
+
+  const base = hasMaintenanceLifecycle(currentMaintenance) ? currentMaintenance : fallbackMaintenance;
+  const fallback = hasMaintenanceLifecycle(fallbackMaintenance) ? fallbackMaintenance : buildUnknownMaintenance();
+
+  return {
+    ...base,
+    isMaintenance: true,
+    statuspageStatus: normalizeMaintenanceStatus(base.statuspageStatus || fallback.statuspageStatus),
+    scheduledFor: normalizeIsoDateTime(base.scheduledFor || fallback.scheduledFor),
+    scheduledUntil: normalizeIsoDateTime(base.scheduledUntil || fallback.scheduledUntil),
+    reason: normalizeWhitespace(base.reason || fallback.reason || ""),
+    method: normalizeWhitespace(base.method || fallback.method || ""),
+  };
+}
+
 function getStoredImpact(existingState) {
   const storedRule = getImpactRule(existingState?.currentImpactKey);
   if (!storedRule) {
@@ -1614,11 +1757,11 @@ function getStoredImpact(existingState) {
 }
 
 function classifyImpactWithRules(title, description, statusHint) {
-  if (normalizeIncidentStatusValue(statusHint?.statuspage) === "resolved") {
+  if (["resolved", "completed"].includes(normalizeIncidentStatusValue(statusHint?.statuspage))) {
     return {
       ...getImpactRule("operational"),
       method: "status",
-      reason: "Statusul incidentului este resolved.",
+      reason: "Statusul incidentului este inchis.",
     };
   }
 
@@ -1663,6 +1806,50 @@ function classifyImpactWithRules(title, description, statusHint) {
   };
 }
 
+function classifyMaintenanceWithRules(entry, statusHint) {
+  const title = normalizeWhitespace(entry?.title || "");
+  const description = prepareTextForTranslation(entry?.description, {
+    stripHtml: true,
+    fallback: "",
+  });
+  const combined = `${title} ${description}`.trim().toLowerCase();
+  const sectionType = normalizeWhitespace(entry?.sectionType || "").toLowerCase();
+  const hasMaintenanceSignal =
+    sectionType === "planned_maintenance" ||
+    /\b(planned maintenance|scheduled maintenance|maintenance window|under maintenance|maintenance)\b/.test(combined);
+
+  if (!hasMaintenanceSignal) {
+    return buildUnknownMaintenance();
+  }
+
+  let statuspageStatus = "scheduled";
+  let reason = "Sectiunea sau textul indica mentenanta programata.";
+  if (
+    /\b(maintenance completed|maintenance complete|completed maintenance|maintenance finished|maintenance ended)\b/.test(combined) ||
+    normalizeIncidentStatusValue(statusHint?.statuspage) === "completed"
+  ) {
+    statuspageStatus = "completed";
+    reason = "Textul indica finalizarea mentenantei.";
+  } else if (
+    /\b(maintenance in progress|under maintenance|maintenance underway|maintenance ongoing|in progress)\b/.test(combined) ||
+    normalizeIncidentStatusValue(statusHint?.statuspage) === "in_progress"
+  ) {
+    statuspageStatus = "in_progress";
+    reason = "Textul indica mentenanta in curs.";
+  }
+
+  const scheduleWindow = extractScheduledWindow(entry);
+
+  return {
+    isMaintenance: true,
+    statuspageStatus,
+    scheduledFor: scheduleWindow.scheduledFor,
+    scheduledUntil: scheduleWindow.scheduledUntil,
+    method: "rules",
+    reason,
+  };
+}
+
 function formatStatusPrefixedTitle(status, titleBase) {
   const cleanBase = normalizeWhitespace(titleBase || "");
   const prefix = getEnglishStatusLabel(status);
@@ -1675,6 +1862,12 @@ function formatStatusPrefixedTitle(status, titleBase) {
 
 function getEnglishStatusLabel(status) {
   switch (status?.key) {
+    case "scheduled":
+      return "Scheduled";
+    case "in_progress":
+      return "In progress";
+    case "completed":
+      return "Completed";
     case "investigating":
       return "Investigating";
     case "identified":
@@ -1909,6 +2102,9 @@ function mapIncidentToComponentStatus(incidentStatus, env, incidentImpact = null
   }
 
   const defaults = {
+    scheduled: "degraded_performance",
+    in_progress: "degraded_performance",
+    completed: "operational",
     investigating: "major_outage",
     identified: "partial_outage",
     monitoring: "degraded_performance",
@@ -1916,6 +2112,9 @@ function mapIncidentToComponentStatus(incidentStatus, env, incidentImpact = null
   };
 
   const overrides = {
+    scheduled: normalizeWhitespace(env?.STATUSPAGE_COMPONENT_STATUS_SCHEDULED || ""),
+    in_progress: normalizeWhitespace(env?.STATUSPAGE_COMPONENT_STATUS_IN_PROGRESS || ""),
+    completed: normalizeWhitespace(env?.STATUSPAGE_COMPONENT_STATUS_COMPLETED || ""),
     investigating: normalizeWhitespace(
       env?.STATUSPAGE_COMPONENT_STATUS_INVESTIGATING || env?.INSTATUS_COMPONENT_STATUS_INVESTIGATING || "",
     ),
@@ -2000,6 +2199,194 @@ async function fetchRSS(env, source) {
   return { ok: false, message: lastMessage };
 }
 
+async function fetchStackStatusPage(env, source) {
+  const url = normalizeWhitespace(source?.sourceUrl || source?.publicStatusUrl || "");
+  if (!url) {
+    return { ok: false, message: "URL-ul paginii de status lipseste." };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort("timeout"), getFetchTimeout(env));
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Accept: "text/html,application/xhtml+xml",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        message: `Preluarea paginii StackStatus a esuat cu codul ${response.status}.`,
+      };
+    }
+
+    return {
+      ok: true,
+      html: await response.text(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: isAbortError(error)
+        ? "Preluarea paginii StackStatus a expirat."
+        : "Preluarea paginii StackStatus a esuat.",
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function parseStackStatusPage(html) {
+  if (!html || typeof html !== "string") {
+    return [];
+  }
+
+  const incidentsSection = extractStackStatusSection(html, "Incidents", "Planned Maintenance");
+  const maintenanceSection = extractStackStatusSection(html, "Planned Maintenance", null);
+
+  return [
+    ...parseStackStatusSectionCards(incidentsSection, "incidents"),
+    ...parseStackStatusSectionCards(maintenanceSection, "planned_maintenance"),
+  ]
+    .filter(Boolean)
+    .sort((left, right) => {
+      const leftTime = Date.parse(left.pubDate || "") || 0;
+      const rightTime = Date.parse(right.pubDate || "") || 0;
+      return rightTime - leftTime;
+    });
+}
+
+function extractStackStatusSection(html, heading, nextHeading) {
+  const headingPattern = new RegExp(`<h3>\\s*${escapeRegExp(heading)}\\s*<\\/h3>([\\s\\S]*?)${nextHeading ? `<h3>\\s*${escapeRegExp(nextHeading)}\\s*<\\/h3>` : "$"}`, "i");
+  const match = html.match(headingPattern);
+  return match?.[1] || "";
+}
+
+function parseStackStatusSectionCards(sectionHtml, sectionType) {
+  if (!sectionHtml) {
+    return [];
+  }
+
+  const chunks = sectionHtml.split(/<div class="card mb-3">/i).slice(1);
+  const entries = [];
+
+  for (const chunk of chunks) {
+    const dateLabel = normalizeWhitespace(decodeXmlEntities(stripHtml(extractFirstMatch(chunk, /<h4\b[^>]*>([\s\S]*?)<\/h4>/i))));
+    const bodyHtml = extractFirstMatch(chunk, /<div class="card-body">([\s\S]*?)<\/div>/i);
+    const description = normalizeWhitespace(decodeXmlEntities(stripHtml(bodyHtml)));
+    if (!description || /^there are no service messages\.?$/i.test(description)) {
+      continue;
+    }
+
+    const title =
+      normalizeWhitespace(
+        decodeXmlEntities(
+          stripHtml(
+            extractFirstMatch(bodyHtml, /<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/i) ||
+            extractFirstMatch(bodyHtml, /<strong\b[^>]*>([\s\S]*?)<\/strong>/i),
+          ),
+        ),
+      ) ||
+      (sectionType === "planned_maintenance"
+        ? `Planned Maintenance - ${dateLabel || "StackStatus"}`
+        : `Incident - ${dateLabel || "StackStatus"}`);
+
+    const pubDate = parseStackStatusDateLabel(dateLabel) || new Date().toISOString();
+    const signature = normalizeWhitespace(`${sectionType}|${dateLabel}|${title}|${description}`).toLowerCase();
+
+    entries.push({
+      entryId: `stackstatus:${sectionType}:${simpleStableId(signature)}`,
+      title,
+      description,
+      pubDate,
+      link: "https://www.stackstatus.com/",
+      sectionType,
+      sectionDateLabel: dateLabel,
+      sourceKey:
+        sectionType === "planned_maintenance"
+          ? `maintenance:${buildSourceIncidentKey(title, getStatusRule("scheduled"))}`
+          : "",
+    });
+  }
+
+  return entries;
+}
+
+function parseStackStatusDateLabel(value) {
+  const normalized = normalizeWhitespace(value || "");
+  const match = normalized.match(/(\d{1,2})-([A-Za-z]{3})-(\d{2,4})/);
+  if (!match) {
+    return "";
+  }
+
+  const monthMap = {
+    jan: 0,
+    feb: 1,
+    mar: 2,
+    apr: 3,
+    may: 4,
+    jun: 5,
+    jul: 6,
+    aug: 7,
+    sep: 8,
+    oct: 9,
+    nov: 10,
+    dec: 11,
+  };
+  const day = Number.parseInt(match[1], 10);
+  const month = monthMap[match[2].toLowerCase()];
+  let year = Number.parseInt(match[3], 10);
+  if (!Number.isFinite(day) || month === undefined || !Number.isFinite(year)) {
+    return "";
+  }
+
+  if (year < 100) {
+    year += year >= 70 ? 1900 : 2000;
+  }
+
+  return new Date(Date.UTC(year, month, day, 12, 0, 0)).toISOString();
+}
+
+function mergeSourceEntries(...collections) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const collection of collections) {
+    if (!Array.isArray(collection)) {
+      continue;
+    }
+
+    for (const entry of collection) {
+      if (!entry) {
+        continue;
+      }
+
+      const key = normalizeWhitespace(
+        entry.entryId ||
+        `${entry.title || ""}|${entry.description || ""}|${entry.pubDate || ""}|${entry.link || ""}`,
+      ).toLowerCase();
+      if (!key || seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      merged.push(entry);
+    }
+  }
+
+  return merged.sort((left, right) => {
+    const leftTime = Date.parse(left.pubDate || "") || 0;
+    const rightTime = Date.parse(right.pubDate || "") || 0;
+    return rightTime - leftTime;
+  });
+}
+
 function parseRSS(xml) {
   if (!xml || typeof xml !== "string") {
     return [];
@@ -2058,6 +2445,106 @@ function buildIncidentFromAtomBlock(block) {
       extractTagValue(block, "pubDate"),
     link: extractAtomLink(block) || extractTagValue(block, "link"),
   };
+}
+
+function extractScheduledWindow(entry) {
+  const text = `${normalizeWhitespace(entry?.title || "")} ${prepareTextForTranslation(entry?.description, {
+    stripHtml: true,
+    fallback: "",
+  })}`.trim();
+  if (!text) {
+    return { scheduledFor: "", scheduledUntil: "" };
+  }
+
+  const isoMatches = [...text.matchAll(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z\b/g)].map((match) =>
+    normalizeIsoDateTime(match[0]),
+  ).filter(Boolean);
+  if (isoMatches.length >= 2) {
+    return {
+      scheduledFor: isoMatches[0],
+      scheduledUntil: isoMatches[1],
+    };
+  }
+
+  const dateSource =
+    parseStackStatusDateLabel(entry?.sectionDateLabel || "") ||
+    normalizeIsoDateTime(entry?.pubDate || "");
+  if (!dateSource) {
+    return { scheduledFor: "", scheduledUntil: "" };
+  }
+
+  const parsedBase = new Date(dateSource);
+  if (!Number.isFinite(parsedBase.getTime())) {
+    return { scheduledFor: "", scheduledUntil: "" };
+  }
+
+  const timeRangeMatch = text.match(
+    /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(UTC|GMT|BST)?\s*(?:to|\-|–|—)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(UTC|GMT|BST)?\b/i,
+  );
+  if (!timeRangeMatch) {
+    return { scheduledFor: "", scheduledUntil: "" };
+  }
+
+  const firstDate = buildScheduledDateTimeFromParts(parsedBase, {
+    hour: timeRangeMatch[1],
+    minute: timeRangeMatch[2],
+    meridiem: timeRangeMatch[3],
+    zone: timeRangeMatch[4],
+  });
+  const secondDate = buildScheduledDateTimeFromParts(parsedBase, {
+    hour: timeRangeMatch[5],
+    minute: timeRangeMatch[6],
+    meridiem: timeRangeMatch[7],
+    zone: timeRangeMatch[8] || timeRangeMatch[4],
+  });
+
+  if (!firstDate || !secondDate) {
+    return { scheduledFor: "", scheduledUntil: "" };
+  }
+
+  let scheduledFor = firstDate.toISOString();
+  let scheduledUntil = secondDate.toISOString();
+  if (secondDate.getTime() <= firstDate.getTime()) {
+    scheduledUntil = new Date(secondDate.getTime() + 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  return { scheduledFor, scheduledUntil };
+}
+
+function buildScheduledDateTimeFromParts(baseDate, parts) {
+  const parsedHour = Number.parseInt(parts?.hour, 10);
+  if (!Number.isFinite(parsedHour)) {
+    return null;
+  }
+
+  let hour = parsedHour;
+  const minute = Number.parseInt(parts?.minute || "0", 10) || 0;
+  const meridiem = normalizeWhitespace(parts?.meridiem || "").toLowerCase();
+  if (meridiem === "pm" && hour < 12) {
+    hour += 12;
+  } else if (meridiem === "am" && hour === 12) {
+    hour = 0;
+  }
+
+  const zone = normalizeWhitespace(parts?.zone || "UTC").toUpperCase();
+  const zoneOffsets = {
+    UTC: 0,
+    GMT: 0,
+    BST: 60,
+  };
+  const offsetMinutes = zoneOffsets[zone];
+  if (offsetMinutes === undefined) {
+    return null;
+  }
+
+  return new Date(Date.UTC(
+    baseDate.getUTCFullYear(),
+    baseDate.getUTCMonth(),
+    baseDate.getUTCDate(),
+    hour,
+    minute,
+    0,
+  ) - offsetMinutes * 60 * 1000);
 }
 
 async function translateTitleToRomanian(input, env, statusHint, options = {}) {
@@ -2301,6 +2788,8 @@ function buildIncidentClassificationPrompt(entry, source, statusHint, env) {
   const payload = [
     `Source: ${normalizeWhitespace(source?.name || "unknown") || "unknown"}`,
     `Lifecycle status hint: ${normalizeIncidentStatusValue(statusHint?.statuspage || "unknown") || "unknown"}`,
+    `Section hint: ${normalizeWhitespace(entry?.sectionType || "unknown") || "unknown"}`,
+    `Published at: ${normalizeWhitespace(entry?.pubDate || "") || "unknown"}`,
     `Title: ${title || "(empty)"}`,
     `Description: ${description || "(empty)"}`,
   ].join("\n");
@@ -2329,7 +2818,22 @@ function extractAiJsonObject(text) {
   }
 }
 
-function normalizeAiImpactClassification(aiPayload) {
+function normalizeIsoDateTime(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized || /^null$/i.test(normalized)) {
+    return "";
+  }
+
+  const parsed = Date.parse(normalized);
+  if (!Number.isFinite(parsed)) {
+    return "";
+  }
+
+  return new Date(parsed).toISOString();
+}
+
+function normalizeAiIncidentClassification(aiPayload) {
+  const reason = normalizeWhitespace(aiPayload?.reason || aiPayload?.explanation || "");
   const impactKey = normalizeImpactKey(
     aiPayload?.impact ||
     aiPayload?.classification ||
@@ -2338,39 +2842,71 @@ function normalizeAiImpactClassification(aiPayload) {
     "",
   );
 
-  if (!impactKey) {
-    return null;
-  }
-
-  if (impactKey === "unknown") {
-    return buildUnknownImpact({
-      method: "ai",
-      reason: normalizeWhitespace(aiPayload?.reason || aiPayload?.explanation || ""),
-    });
-  }
-
-  const rule = getImpactRule(impactKey);
-  if (!rule) {
-    return null;
-  }
-
   const confidence = Number.parseFloat(aiPayload?.confidence);
+  const impact =
+    impactKey === "unknown"
+      ? buildUnknownImpact({
+        method: "ai",
+        reason,
+      })
+      : getImpactRule(impactKey)
+        ? {
+          ...getImpactRule(impactKey),
+          method: "ai",
+          reason,
+          confidence: Number.isFinite(confidence) ? confidence : undefined,
+        }
+        : buildUnknownImpact();
+
+  const eventType = normalizeWhitespace(aiPayload?.event_type || aiPayload?.type || "").toLowerCase();
+  const eventStatus = normalizeWhitespace(aiPayload?.event_status || aiPayload?.status || "").toLowerCase();
+  const maintenanceStatus = normalizeMaintenanceStatus(eventStatus);
+  const maintenance =
+    eventType === "scheduled_maintenance" || maintenanceStatus
+      ? {
+        isMaintenance: true,
+        statuspageStatus: maintenanceStatus || "scheduled",
+        scheduledFor: normalizeIsoDateTime(aiPayload?.scheduled_for || aiPayload?.start_at || ""),
+        scheduledUntil: normalizeIsoDateTime(aiPayload?.scheduled_until || aiPayload?.end_at || ""),
+        method: "ai",
+        reason,
+      }
+      : buildUnknownMaintenance();
+
+  const status =
+    getStatusRuleByStatuspageValue(maintenance.statuspageStatus) ||
+    getStatusRuleByStatuspageValue(eventStatus) ||
+    null;
+
   return {
-    ...rule,
-    method: "ai",
-    reason: normalizeWhitespace(aiPayload?.reason || aiPayload?.explanation || ""),
-    confidence: Number.isFinite(confidence) ? confidence : undefined,
+    impact,
+    maintenance,
+    status,
   };
 }
 
-async function classifyIncidentImpact(entry, env, source, statusHint) {
+function classifyIncidentWithRules(entry, statusHint) {
+  const maintenance = classifyMaintenanceWithRules(entry, statusHint);
+  const status = hasMaintenanceLifecycle(maintenance)
+    ? getStatusRuleByStatuspageValue(maintenance.statuspageStatus) || statusHint
+    : statusHint;
+  return {
+    impact: classifyImpactWithRules(entry?.title, entry?.description, status) || buildUnknownImpact(),
+    maintenance,
+    status,
+  };
+}
+
+async function classifyIncidentSemantics(entry, env, source, statusHint) {
+  const rules = classifyIncidentWithRules(entry, statusHint);
+
   if (shouldUseAiIncidentClassification(env)) {
     try {
       const messages = [
         {
           role: "system",
           content:
-            "You classify incident impact from source text only. Return strict minified JSON with keys impact, confidence, reason. impact must be exactly one of: major_outage, partial_outage, degraded_performance, operational, unknown. Use only the provided text. If the text is ambiguous, return unknown. Scheduled or planned maintenance without total unavailability maps to degraded_performance. Resolved, restored, completed, or operational maps to operational.",
+            "You classify source status text only. Return strict minified JSON with keys impact, event_type, event_status, scheduled_for, scheduled_until, confidence, reason. impact must be exactly one of: major_outage, partial_outage, degraded_performance, operational, unknown. event_type must be exactly one of: realtime_incident, scheduled_maintenance, unknown. event_status must be exactly one of: investigating, identified, monitoring, resolved, scheduled, in_progress, completed, unknown. scheduled_for and scheduled_until must be RFC3339 UTC timestamps or null, and only when the timing is explicit in the provided text. Do not invent facts. If ambiguous, use unknown or null. Scheduled or planned maintenance without total unavailability maps to degraded_performance. Resolved, restored, completed, or operational maps to operational.",
         },
         {
           role: "user",
@@ -2380,21 +2916,18 @@ async function classifyIncidentImpact(entry, env, source, statusHint) {
       const aiResponse = await env.AI.run(getAiIncidentClassificationModel(env), { messages });
       const aiText = extractAiTranslatedText(aiResponse);
       const aiPayload = extractAiJsonObject(aiText);
-      const normalized = normalizeAiImpactClassification(aiPayload);
-      if (hasKnownImpact(normalized)) {
-        return normalized;
-      }
+      const normalized = normalizeAiIncidentClassification(aiPayload || {});
+      return {
+        impact: hasKnownImpact(normalized.impact) ? normalized.impact : rules.impact,
+        maintenance: mergeMaintenanceState(normalized.maintenance, rules.maintenance),
+        status: normalized.status || rules.status || statusHint,
+      };
     } catch (error) {
       console.error("Eroare clasificare AI impact:", sanitizeError(error));
     }
   }
 
-  const rulesImpact = classifyImpactWithRules(entry?.title, entry?.description, statusHint);
-  if (rulesImpact) {
-    return rulesImpact;
-  }
-
-  return buildUnknownImpact();
+  return rules;
 }
 
 function extractAiTranslatedText(aiResponse) {
@@ -2529,6 +3062,9 @@ function normalizeTranslatedStatusPhrases(text, statusHint) {
   let normalized = String(text || "");
 
   normalized = normalized
+    .replace(/\b(?:scheduled maintenance|planned maintenance|scheduled)\b/gi, "Mentenanta programata")
+    .replace(/\b(?:maintenance in progress|under maintenance|in progress)\b/gi, "Mentenanta in curs")
+    .replace(/\b(?:maintenance completed|maintenance complete|completed)\b/gi, "Mentenanta finalizata")
     .replace(/\b(?:investigating|investigating issue|under investigation)\b/gi, "Investigam")
     .replace(/\b(?:identified|issue identified|cause identified)\b/gi, "Identificat")
     .replace(/\b(?:monitoring|closely monitoring)\b/gi, "Monitorizam")
@@ -2544,9 +3080,11 @@ function normalizeTranslatedStatusPhrases(text, statusHint) {
 async function createStatuspageIncident(env, sourceIncident) {
   const config = getStatuspageConfig(env);
   const url = `${config.apiBaseUrl}/v1/pages/${encodeURIComponent(config.pageId)}/incidents`;
-  const payload = buildStatuspageIncidentPayload(env, config, sourceIncident);
+  const { incident, publishedMaintenance } = buildStatuspageIncidentPayload(env, config, sourceIncident);
+  sourceIncident.publishedMaintenance = publishedMaintenance;
+  sourceIncident.publishedStatus = incident.status;
 
-  const response = await performStatuspageRequest(env, url, "POST", payload);
+  const response = await performStatuspageRequest(env, url, "POST", { incident });
   if (!response.ok) {
     return response;
   }
@@ -2569,9 +3107,11 @@ async function updateExistingStatuspageIncident(env, existingState, sourceIncide
   const config = getStatuspageConfig(env);
   const incidentId = getStoredIncidentId(existingState);
   const incidentUrl = `${config.apiBaseUrl}/v1/pages/${encodeURIComponent(config.pageId)}/incidents/${encodeURIComponent(incidentId)}`;
-  const payload = buildStatuspageIncidentPayload(env, config, sourceIncident);
+  const { incident, publishedMaintenance } = buildStatuspageIncidentPayload(env, config, sourceIncident, existingState);
+  sourceIncident.publishedMaintenance = publishedMaintenance;
+  sourceIncident.publishedStatus = incident.status;
 
-  const response = await performStatuspageRequest(env, incidentUrl, "PATCH", payload);
+  const response = await performStatuspageRequest(env, incidentUrl, "PATCH", { incident });
   if (!response.ok) {
     return response;
   }
@@ -2582,12 +3122,17 @@ async function updateExistingStatuspageIncident(env, existingState, sourceIncide
   };
 }
 
-function buildStatuspageIncidentPayload(env, config, sourceIncident) {
+function buildStatuspageIncidentPayload(env, config, sourceIncident, existingState = null) {
+  const publishedMaintenance = resolvePublishedMaintenance(sourceIncident, existingState);
+  const maintenanceStatus = normalizeMaintenanceStatus(publishedMaintenance.statuspageStatus);
+  const effectiveStatus =
+    maintenanceStatus ||
+    getFallbackStatuspageStatusForSourceIncident(sourceIncident);
   const incident = applyAffectedComponents(
     {
       name: sourceIncident.publicIncident.title,
       body: sourceIncident.publicIncident.description,
-      status: sourceIncident.status.statuspage,
+      status: effectiveStatus,
       deliver_notifications: config.deliverNotifications,
     },
     env,
@@ -2598,7 +3143,41 @@ function buildStatuspageIncidentPayload(env, config, sourceIncident) {
     incident.impact_override = sourceIncident.impact.impactOverride;
   }
 
-  return { incident };
+  if (hasMaintenanceLifecycle(publishedMaintenance) && publishedMaintenance.scheduledFor) {
+    incident.scheduled_for = publishedMaintenance.scheduledFor;
+    incident.scheduled_until = publishedMaintenance.scheduledUntil || publishedMaintenance.scheduledFor;
+    incident.scheduled_remind_prior = true;
+    incident.auto_transition_to_maintenance_state = true;
+    incident.auto_transition_to_operational_state = true;
+    incident.scheduled_auto_in_progress = true;
+    incident.scheduled_auto_completed = true;
+    incident.auto_transition_deliver_notifications_at_start = config.deliverNotifications;
+    incident.auto_transition_deliver_notifications_at_end = config.deliverNotifications;
+  }
+
+  return { incident, publishedMaintenance };
+}
+
+function resolvePublishedMaintenance(sourceIncident, existingState = null) {
+  const maintenance = mergeMaintenanceState(sourceIncident?.maintenance, getStoredMaintenance(existingState));
+  if (!hasMaintenanceLifecycle(maintenance) || !maintenance.scheduledFor) {
+    return buildUnknownMaintenance();
+  }
+
+  return maintenance;
+}
+
+function getFallbackStatuspageStatusForSourceIncident(sourceIncident) {
+  const maintenanceStatus = normalizeMaintenanceStatus(sourceIncident?.maintenance?.statuspageStatus || "");
+  if (maintenanceStatus === "completed") {
+    return "resolved";
+  }
+
+  if (maintenanceStatus === "scheduled" || maintenanceStatus === "in_progress") {
+    return "monitoring";
+  }
+
+  return sourceIncident?.status?.statuspage || "investigating";
 }
 
 function isStatuspageRateLimitedStatus(statusCode) {
@@ -2702,6 +3281,22 @@ function extractTagValue(block, tagName) {
   }
 
   return normalizeWhitespace(decodeXmlEntities(removeCdata(match[1] || "")));
+}
+
+function extractFirstMatch(text, pattern) {
+  const match = String(text || "").match(pattern);
+  return match?.[1] || "";
+}
+
+function simpleStableId(input) {
+  const value = String(input || "");
+  let hash = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+
+  return hash.toString(36);
 }
 
 function extractAtomLink(block) {

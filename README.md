@@ -6,6 +6,7 @@ Worker Cloudflare care:
 - parseaza RSS/Atom fara librarii externe
 - traduce continutul in romana cu Workers AI
 - clasifica impactul din textul original cu Workers AI
+- detecteaza si publica mentenanta programata ca `scheduled incident` in Statuspage
 - detecteaza doar intrarile noi cu KV, separat pe sursa
 - creeaza si actualizeaza incidente in Atlassian Statuspage
 - poate marca automat incidentele ca rezolvate daca sursa nu mai raporteaza probleme active
@@ -41,9 +42,10 @@ Le gasesti in interfata de management Statuspage, la `API info`.
 3. Normalizeaza toate sursele intr-un format comun.
 4. Traduce titlul si descrierea in romana.
 5. Clasifica impactul textului in `major_outage / partial_outage / degraded_performance / operational`.
-6. Tine stare in KV pentru fiecare sursa, ca sa nu dubleze incidentele.
-7. Leaga update-urile `investigating / identified / monitoring / resolved` de acelasi incident Statuspage.
-8. Poate colora automat componentele din Statuspage daca setezi `component_ids`.
+6. Detecteaza mentenanta programata din text si din pagina StackStatus 20i si o publica drept `scheduled incident` cand exista fereastra de timp.
+7. Tine stare in KV pentru fiecare sursa, ca sa nu dubleze incidentele.
+8. Leaga update-urile de acelasi incident Statuspage, inclusiv pentru mentenanta.
+9. Poate colora automat componentele din Statuspage daca setezi `component_ids`.
 
 ## Deploy si configurare
 
@@ -125,6 +127,9 @@ In [`wrangler.toml`](/D:/Apps/Status-page-stackstatus/wrangler.toml) poti modifi
 - `STATUSPAGE_COMPONENT_STATUS_IDENTIFIED`
 - `STATUSPAGE_COMPONENT_STATUS_MONITORING`
 - `STATUSPAGE_COMPONENT_STATUS_RESOLVED`
+- `STATUSPAGE_COMPONENT_STATUS_SCHEDULED`
+- `STATUSPAGE_COMPONENT_STATUS_IN_PROGRESS`
+- `STATUSPAGE_COMPONENT_STATUS_COMPLETED`
 - `UPMIND_STATUS_PAGE_ID`
 - `UPMIND_API_BASE_URL`
 - `UPMIND_SOURCE_NAME`
@@ -226,6 +231,9 @@ https://worker-ul-tau.workers.dev/?sync=1&token=TOKENUL_TAU&diagnostic=1&status=
 - `STATUSPAGE_COMPONENT_STATUS_IDENTIFIED` - optional
 - `STATUSPAGE_COMPONENT_STATUS_MONITORING` - optional
 - `STATUSPAGE_COMPONENT_STATUS_RESOLVED` - optional
+- `STATUSPAGE_COMPONENT_STATUS_SCHEDULED` - optional
+- `STATUSPAGE_COMPONENT_STATUS_IN_PROGRESS` - optional
+- `STATUSPAGE_COMPONENT_STATUS_COMPLETED` - optional
 - `UPMIND_STATUS_PAGE_ID` - optional, activeaza sursa Upmind
 - `UPMIND_API_BASE_URL` - optional, implicit `https://oneuptime.com`
 - `UPMIND_SOURCE_NAME` - optional
@@ -260,6 +268,9 @@ Maparea implicita este:
 - `identified` -> `partial_outage`
 - `monitoring` -> `degraded_performance`
 - `resolved` -> `operational`
+- `scheduled` -> `degraded_performance`
+- `in_progress` -> `degraded_performance`
+- `completed` -> `operational`
 
 Daca AI sau regulile gasesc un impact explicit in text, componentele si `impact_override` din Statuspage folosesc acel impact in locul maparii implicite de mai sus.
 
