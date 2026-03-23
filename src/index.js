@@ -380,12 +380,27 @@ async function handleRequest(_request, env) {
   const isManualSync = requestUrl.searchParams.get("sync") === "1";
   const providedToken = requestUrl.searchParams.get("token") || "";
   const isDiagnosticRequest = requestUrl.searchParams.get("diagnostic") === "1";
+  const isClassificationRequest = requestUrl.searchParams.get("classify") === "1";
   const allowManualSync = Boolean(
     isManualSync &&
       env.MANUAL_SYNC_TOKEN &&
       providedToken &&
       providedToken === env.MANUAL_SYNC_TOKEN,
   );
+
+  if (allowManualSync && isClassificationRequest) {
+    const result = await processClassificationPreview(env, {
+      requestedStatus: requestUrl.searchParams.get("status") || requestUrl.searchParams.get("status_hint") || "",
+      title: requestUrl.searchParams.get("title") || "",
+      description: requestUrl.searchParams.get("message") || requestUrl.searchParams.get("description") || "",
+      sourceName: requestUrl.searchParams.get("source") || requestUrl.searchParams.get("source_name") || "",
+      sectionType: requestUrl.searchParams.get("section") || requestUrl.searchParams.get("section_type") || "",
+      sectionDateLabel: requestUrl.searchParams.get("section_date") || "",
+      pubDate: requestUrl.searchParams.get("pub_date") || "",
+    });
+
+    return jsonResponse(result.payload, result.httpStatus);
+  }
 
   if (allowManualSync && isDiagnosticRequest) {
     const result = await processDiagnosticIncident(env, {
@@ -414,6 +429,78 @@ async function handleRequest(_request, env) {
     },
     result.httpStatus,
   );
+}
+
+async function processClassificationPreview(env, options = {}) {
+  const rawTitle = normalizeWhitespace(options.title || "");
+  const rawDescription = normalizeWhitespace(options.description || "");
+  if (!rawTitle && !rawDescription) {
+    return {
+      httpStatus: 400,
+      payload: {
+        status: "Trimite macar title sau description pentru clasificare.",
+        incident: null,
+        classification: null,
+      },
+    };
+  }
+
+  const statusHint = parseDiagnosticStatus(options.requestedStatus);
+  const source = {
+    id: "classification-preview",
+    name: normalizeWhitespace(options.sourceName || "Classification Preview"),
+    type: "manual",
+    sourceUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
+    publicStatusUrl: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
+    hideSourceLinks: true,
+    componentIdsRaw: "",
+    componentStatusUpdatesEnabled: false,
+  };
+  const entry = {
+    sourceKey: "",
+    entryId: `classification-preview:${Date.now()}`,
+    title: rawTitle || "Untitled classification preview",
+    description: rawDescription || rawTitle,
+    pubDate: normalizeWhitespace(options.pubDate || "") || new Date().toISOString(),
+    link: normalizeWhitespace(env?.PUBLIC_STATUS_URL || ""),
+    sectionType: normalizeWhitespace(options.sectionType || ""),
+    sectionDateLabel: normalizeWhitespace(options.sectionDateLabel || ""),
+  };
+  const sourceIncident = await buildSourceIncident(entry, env, source);
+
+  if (statusHint?.statuspage && !sourceIncident.status?.statuspage) {
+    sourceIncident.status = statusHint;
+  }
+
+  return {
+    httpStatus: 200,
+    payload: {
+      status: "Clasificare generata.",
+      incident: sourceIncident.publicIncident,
+      classification: {
+        lifecycle_status: normalizeWhitespace(sourceIncident?.status?.statuspage || "") || null,
+        lifecycle_label: normalizeWhitespace(sourceIncident?.status?.translated || "") || null,
+        impact: normalizeWhitespace(sourceIncident?.impact?.key || "") || "unknown",
+        impact_override: normalizeWhitespace(sourceIncident?.impact?.impactOverride || "") || null,
+        component_status: normalizeWhitespace(sourceIncident?.impact?.componentStatus || "") || null,
+        reason: normalizeWhitespace(sourceIncident?.impact?.reason || sourceIncident?.maintenance?.reason || "") || null,
+        confidence:
+          Number.isFinite(Number.parseFloat(sourceIncident?.impact?.confidence))
+            ? Number(Number.parseFloat(sourceIncident.impact.confidence).toFixed(3))
+            : null,
+        is_maintenance: Boolean(sourceIncident?.maintenance?.isMaintenance),
+        maintenance_status: normalizeWhitespace(sourceIncident?.maintenance?.statuspageStatus || "") || null,
+        scheduled_for: normalizeIsoDateTime(sourceIncident?.maintenance?.scheduledFor || "") || null,
+        scheduled_until: normalizeIsoDateTime(sourceIncident?.maintenance?.scheduledUntil || "") || null,
+      },
+      raw: {
+        title: rawTitle || null,
+        description: rawDescription || null,
+        source: source.name,
+        section_type: entry.sectionType || null,
+      },
+    },
+  };
 }
 
 async function processDiagnosticIncident(env, options = {}) {
