@@ -2897,7 +2897,42 @@ function classifyIncidentWithRules(entry, statusHint) {
   };
 }
 
+function buildForcedSemanticsFromStatus(statusHint) {
+  const impactKeyByStatus = {
+    scheduled: "degraded_performance",
+    in_progress: "degraded_performance",
+    completed: "operational",
+    investigating: "major_outage",
+    identified: "partial_outage",
+    monitoring: "degraded_performance",
+    resolved: "operational",
+  };
+  const impactRule = getImpactRule(impactKeyByStatus[statusHint?.statuspage] || "");
+
+  return {
+    impact: impactRule
+      ? {
+        ...impactRule,
+        method: "forced",
+        reason: `Impact fortat dupa statusul manual ${statusHint?.statuspage || "necunoscut"}.`,
+      }
+      : buildUnknownImpact({
+        method: "forced",
+        reason: "Nu a fost gasita o mapare fortata pentru statusul manual.",
+      }),
+    maintenance: buildUnknownMaintenance({
+      method: "forced",
+      reason: "Fluxul de diagnostic manual nu foloseste mentenanta programata.",
+    }),
+    status: statusHint,
+  };
+}
+
 async function classifyIncidentSemantics(entry, env, source, statusHint) {
+  if (normalizeWhitespace(source?.id || "").toLowerCase() === "diagnostic") {
+    return buildForcedSemanticsFromStatus(statusHint);
+  }
+
   const rules = classifyIncidentWithRules(entry, statusHint);
 
   if (shouldUseAiIncidentClassification(env)) {
