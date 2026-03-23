@@ -600,6 +600,8 @@ async function processLatestIncident(env, context = {}) {
     let primaryIncidentPriority = -1;
     let primaryIncidentTimestamp = -1;
     const sourceMessages = [];
+    let successfulSourceCount = 0;
+    let firstFailure = null;
 
     for (const source of sources) {
       const sourceResult = await processSource(source, env, context);
@@ -620,22 +622,44 @@ async function processLatestIncident(env, context = {}) {
         primaryIncidentTimestamp = sourceResult.incidentTimestamp;
       }
 
-      sourceMessages.push(sourceResult.status);
+      sourceMessages.push(prefixSourceStatus(source, sourceResult.status));
 
-      if (!sourceResult.ok) {
-        return buildResult(
-          buildPublicStatusSummary(sourceMessages),
-          sourceResult.incident || primaryIncident,
-          sourceResult.httpStatus,
-        );
+      if (sourceResult.ok) {
+        successfulSourceCount += 1;
+      } else if (!firstFailure) {
+        firstFailure = sourceResult;
       }
     }
 
-    return buildResult(buildPublicStatusSummary(sourceMessages), primaryIncident, 200);
+    const summary = buildPublicStatusSummary(sourceMessages);
+    if (firstFailure && !successfulSourceCount) {
+      return buildResult(summary, firstFailure.incident || primaryIncident, firstFailure.httpStatus);
+    }
+
+    return buildResult(summary, primaryIncident || firstFailure?.incident || null, 200);
   } catch (error) {
     console.error("Eroare procesare:", sanitizeError(error));
     return buildResult("A aparut o eroare la procesarea incidentului.", null, 500);
   }
+}
+
+function prefixSourceStatus(source, message) {
+  const sourceName = normalizeWhitespace(source?.name || "");
+  const normalizedMessage = normalizeWhitespace(message || "");
+  if (!sourceName) {
+    return normalizedMessage;
+  }
+
+  if (!normalizedMessage) {
+    return `${sourceName}: status indisponibil.`;
+  }
+
+  const normalizedPrefix = `${sourceName.toLowerCase()}:`;
+  if (normalizedMessage.toLowerCase().startsWith(normalizedPrefix)) {
+    return normalizedMessage;
+  }
+
+  return `${sourceName}: ${normalizedMessage}`;
 }
 
 function buildPublicStatusSummary(messages) {
@@ -2268,7 +2292,9 @@ async function fetchRSS(env, source) {
       }
 
       const xml = await response.text();
-      if (!xml || (!xml.includes("<item") && !xml.includes("<entry"))) {
+      const hasFeedItems = /<(item|entry)\b/i.test(xml || "");
+      const looksLikeFeedDocument = /<(rss|feed|rdf:RDF)\b/i.test(xml || "");
+      if (!xml || (!hasFeedItems && !looksLikeFeedDocument)) {
         lastMessage = "RSS-ul primit este gol sau invalid.";
         continue;
       }
